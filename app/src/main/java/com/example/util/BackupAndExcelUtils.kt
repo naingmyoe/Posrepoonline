@@ -292,7 +292,7 @@ object BackupAndExcelUtils {
 
     // 3. EXCEL IMPORT FUNCTIONS
     fun importProductsFromCSV(context: Context, uri: Uri, viewModel: POSViewModel): Int {
-        var count = 0
+        val importedProducts = mutableListOf<Product>()
         try {
             context.contentResolver.openInputStream(uri)?.use { inputStream ->
                 val reader = BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8))
@@ -319,27 +319,30 @@ object BackupAndExcelUtils {
                             val note = tokens.getOrNull(8) ?: ""
 
                             if (name.isNotEmpty()) {
-                                val product = Product(
-                                    barcode = barcode,
-                                    name = name,
-                                    groupName = groupName,
-                                    purchasePrice = purchasePrice,
-                                    sellingPrice = sellingPrice,
-                                    unit = unit,
-                                    quantity = quantity,
-                                    alertQuantity = alertQuantity,
-                                    note = note,
-                                    trackStock = true
+                                importedProducts.add(
+                                    Product(
+                                        barcode = barcode,
+                                        name = name,
+                                        groupName = groupName,
+                                        purchasePrice = purchasePrice,
+                                        sellingPrice = sellingPrice,
+                                        unit = unit,
+                                        quantity = quantity,
+                                        alertQuantity = alertQuantity,
+                                        note = note,
+                                        trackStock = true
+                                    )
                                 )
-                                viewModel.insertDirectProduct(product)
-                                count++
                             }
                         }
                     }
                 }
             }
+            if (importedProducts.isNotEmpty()) {
+                viewModel.importProductsBatchDirect(importedProducts)
+            }
         } catch (_: Exception) {}
-        return count
+        return importedProducts.size
     }
 
     fun importCustomersFromCSV(context: Context, uri: Uri, viewModel: POSViewModel): Int {

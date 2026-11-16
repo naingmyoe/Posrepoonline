@@ -419,7 +419,11 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                             val activeAcc = _currentUser.value ?: (if (!phone.isNullOrBlank()) repository.getAccountByPhone(phone) else null)
                             val isAllowedToSync = activeAcc != null && activeAcc.status == "on" && (activeAcc.role != "CASHIER" || activeAcc.adminPhone.isNotBlank())
                             if (!isLoggingOutState && !phone.isNullOrBlank() && isAllowedToSync && serverCheck.isReachable && !_isUploading.value) {
-                                triggerRealSync()
+                                if (sharedPrefs.getBoolean("pending_db_restore_mirror", false)) {
+                                    mirrorLocalToCloudDirect()
+                                } else {
+                                    triggerRealSync()
+                                }
                             }
                         }
                     }
@@ -462,35 +466,41 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                                 val activeAcc = _currentUser.value ?: repository.getAccountByPhone(phone)
                                 val isAllowedToSync = activeAcc != null && activeAcc.status == "on" && (activeAcc.role != "CASHIER" || activeAcc.adminPhone.isNotBlank())
                                 if (isAllowedToSync && !sharedPrefs.getString("logged_in_phone", null).isNullOrBlank()) {
-                                    // 1. Upload any local offline backlog
-                                    val unsyncedV = repository.getUnsyncedCompletedVouchers()
-                                    val unsyncedP = repository.getUnsyncedProducts()
-                                    val unsyncedC = repository.getUnsyncedCustomers()
-                                    if (unsyncedV.isNotEmpty() || unsyncedP.isNotEmpty() || unsyncedC.isNotEmpty()) {
-                                        triggerRealSync()
-                                    }
+                                    val pendingRestoreMirror = sharedPrefs.getBoolean("pending_db_restore_mirror", false)
+                                    if (pendingRestoreMirror) {
+                                        mirrorLocalToCloudDirect()
+                                    } else {
+                                        // 1. Upload any local offline backlog
+                                        val unsyncedV = repository.getUnsyncedCompletedVouchers()
+                                        val unsyncedP = repository.getUnsyncedProducts()
+                                        val unsyncedC = repository.getUnsyncedCustomers()
+                                        if (unsyncedV.isNotEmpty() || unsyncedP.isNotEmpty() || unsyncedC.isNotEmpty()) {
+                                            triggerRealSync()
+                                        }
 
-                                    // 2. Multi-device real-time sync: silently pull latest sales, stock & product edits from other phones every 6s
-                                    cycleCount++
-                                    if (cycleCount >= 1 && !_isUploading.value && !isLoggingOutState) {
-                                        cycleCount = 0
-                                        val capturedToken = sessionToken
-                                        syncMutex.withLock {
-                                            val stillLoggedIn = !isLoggingOutState &&
-                                                capturedToken == sessionToken &&
-                                                !sharedPrefs.getString("logged_in_phone", null).isNullOrBlank()
-                                            if (stillLoggedIn) {
-                                                val cloudTargetPhone = getCloudPhone(phone)
-                                                com.example.util.SyncManager.pullCloudData(
-                                                    workerUrl = currentUrl,
-                                                    userPhone = cloudTargetPhone,
-                                                    repository = repository,
-                                                    pendingDeletedCustomers = getPendingDeletedCustomers().toSet(),
-                                                    pendingDeletedSuppliers = getPendingDeletedSuppliers().toSet(),
-                                                    pendingDeletedGroups = getPendingDeletedGroups().toSet(),
-                                                    pendingDeletedUnits = getPendingDeletedUnits().toSet(),
-                                                    pendingDeletedPayments = getPendingDeletedPayments().toSet()
-                                                )
+                                        // 2. Multi-device real-time sync: silently pull latest sales, stock & product edits from other phones every 6s
+                                        cycleCount++
+                                        if (cycleCount >= 1 && !_isUploading.value && !isLoggingOutState && !sharedPrefs.getBoolean("pending_db_restore_mirror", false)) {
+                                            cycleCount = 0
+                                            val capturedToken = sessionToken
+                                            syncMutex.withLock {
+                                                val stillLoggedIn = !isLoggingOutState &&
+                                                    capturedToken == sessionToken &&
+                                                    !sharedPrefs.getString("logged_in_phone", null).isNullOrBlank() &&
+                                                    !sharedPrefs.getBoolean("pending_db_restore_mirror", false)
+                                                if (stillLoggedIn) {
+                                                    val cloudTargetPhone = getCloudPhone(phone)
+                                                    com.example.util.SyncManager.pullCloudData(
+                                                        workerUrl = currentUrl,
+                                                        userPhone = cloudTargetPhone,
+                                                        repository = repository,
+                                                        pendingDeletedCustomers = getPendingDeletedCustomers().toSet(),
+                                                        pendingDeletedSuppliers = getPendingDeletedSuppliers().toSet(),
+                                                        pendingDeletedGroups = getPendingDeletedGroups().toSet(),
+                                                        pendingDeletedUnits = getPendingDeletedUnits().toSet(),
+                                                        pendingDeletedPayments = getPendingDeletedPayments().toSet()
+                                                    )
+                                                }
                                             }
                                         }
                                     }
@@ -1783,19 +1793,6 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         isSynced = false
                     )
                     repository.updateProduct(updatedProduct)
-                    val phone = getCloudPhone()
-                    if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
-                        viewModelScope.launch(Dispatchers.IO) {
-                            com.example.util.SyncManager.adjustStockOnCloud(
-                                workerUrl = cloudflareWorkerUrl.value,
-                                userPhone = phone,
-                                productId = updatedProduct.id,
-                                productName = updatedProduct.name,
-                                newQuantity = updatedProduct.quantity,
-                                newAlertQuantity = updatedProduct.alertQuantity
-                            )
-                        }
-                    }
                     editingProduct.value = null
                     savedProduct = updatedProduct
 
@@ -1825,9 +1822,23 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     savedProduct = product.copy(id = newId)
                 }
 
-                // Auto-sync in background if online
-                if (com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                // Auto-sync in background if online (without concurrent race against adjustStockOnCloud)
+                val phone = getCloudPhone()
+                if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                    val editedToAdjust = if (currentEditing != null) savedProduct else null
                     viewModelScope.launch {
+                        if (editedToAdjust != null) {
+                            syncMutex.withLock {
+                                com.example.util.SyncManager.adjustStockOnCloud(
+                                    workerUrl = cloudflareWorkerUrl.value,
+                                    userPhone = phone,
+                                    productId = editedToAdjust.id,
+                                    productName = editedToAdjust.name,
+                                    newQuantity = editedToAdjust.quantity,
+                                    newAlertQuantity = editedToAdjust.alertQuantity
+                                )
+                            }
+                        }
                         triggerRealSync()
                     }
                 }
@@ -1866,14 +1877,51 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun importProductsBatchDirect(products: List<Product>, onComplete: () -> Unit = {}) {
+        if (products.isEmpty()) {
+            onComplete()
+            return
+        }
+        viewModelScope.launch {
+            val insertedIds = mutableListOf<Long>()
+            repository.runInTransaction {
+                val existingGroups = repository.getAllGroupsDirect().map { it.name.trim().lowercase() }.toMutableSet()
+                val existingUnits = repository.getAllUnitsDirect().map { it.name.trim().lowercase() }.toMutableSet()
+                products.forEach { product ->
+                    val newId = repository.insertProduct(product.copy(isSynced = false))
+                    insertedIds.add(newId)
+                    if (product.groupName.isNotBlank() && existingGroups.add(product.groupName.trim().lowercase())) {
+                        repository.insertGroup(ProductGroup(product.groupName.trim()))
+                        recordPendingGroupChange(product.groupName.trim())
+                    }
+                    if (product.unit.isNotBlank() && existingUnits.add(product.unit.trim().lowercase())) {
+                        repository.insertUnit(ProductUnit(product.unit.trim()))
+                        recordPendingUnitChange(product.unit.trim())
+                    }
+                }
+            }
+            if (insertedIds.isNotEmpty()) {
+                val currentSet = sharedPrefs.getStringSet("manual_stock_adjusted_products", mutableSetOf())?.toMutableSet() ?: mutableSetOf()
+                insertedIds.forEach { currentSet.add(it.toString()) }
+                sharedPrefs.edit().putStringSet("manual_stock_adjusted_products", currentSet).apply()
+            }
+            if (com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                triggerRealSync()
+            }
+            onComplete()
+        }
+    }
+
     fun importVouchersDirect(vouchers: List<Voucher>, onComplete: () -> Unit = {}) {
         if (vouchers.isEmpty()) {
             onComplete()
             return
         }
         viewModelScope.launch {
-            vouchers.forEach { voucher ->
-                repository.insertVoucher(voucher.copy(isSynced = false))
+            repository.runInTransaction {
+                vouchers.forEach { voucher ->
+                    repository.insertVoucher(voucher.copy(isSynced = false))
+                }
             }
             if (com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
                 triggerRealSync()
@@ -1888,12 +1936,14 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         viewModelScope.launch {
-            val existingCategories = repository.getAllExpenseCategoriesDirect().map { it.name.lowercase() }.toMutableSet()
-            expenses.forEach { expense ->
-                if (expense.categoryName.isNotBlank() && existingCategories.add(expense.categoryName.lowercase())) {
-                    repository.insertExpenseCategory(ExpenseCategory(name = expense.categoryName, iconName = "ShoppingCart"))
+            repository.runInTransaction {
+                val existingCategories = repository.getAllExpenseCategoriesDirect().map { it.name.lowercase() }.toMutableSet()
+                expenses.forEach { expense ->
+                    if (expense.categoryName.isNotBlank() && existingCategories.add(expense.categoryName.lowercase())) {
+                        repository.insertExpenseCategory(ExpenseCategory(name = expense.categoryName, iconName = "ShoppingCart"))
+                    }
+                    repository.insertExpense(expense)
                 }
-                repository.insertExpense(expense)
             }
             if (com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
                 triggerRealSync()
@@ -2663,7 +2713,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             val phone = getCloudPhone()
             val prod = repository.getProductDirect(productId)
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
-                viewModelScope.launch(Dispatchers.IO) {
+                val ok = syncMutex.withLock {
                     com.example.util.SyncManager.adjustStockOnCloud(
                         workerUrl = cloudflareWorkerUrl.value,
                         userPhone = phone,
@@ -2673,7 +2723,12 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         newAlertQuantity = prod?.alertQuantity ?: 0
                     )
                 }
-                triggerRealSync()
+                if (ok) {
+                    repository.markProductsSynced(listOf(productId))
+                    removeManualStockAdjustment(productId)
+                } else {
+                    triggerRealSync()
+                }
             }
         }
     }
@@ -2685,7 +2740,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             val phone = getCloudPhone()
             val prod = repository.getProductDirect(productId)
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
-                viewModelScope.launch(Dispatchers.IO) {
+                val ok = syncMutex.withLock {
                     com.example.util.SyncManager.adjustStockOnCloud(
                         workerUrl = cloudflareWorkerUrl.value,
                         userPhone = phone,
@@ -2695,7 +2750,12 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         newAlertQuantity = newAlertQuantity
                     )
                 }
-                triggerRealSync()
+                if (ok) {
+                    repository.markProductsSynced(listOf(productId))
+                    removeManualStockAdjustment(productId)
+                } else {
+                    triggerRealSync()
+                }
             }
         }
     }
@@ -2744,17 +2804,23 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
 
             val phone = getCloudPhone()
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
-                viewModelScope.launch(Dispatchers.IO) {
-                    com.example.util.SyncManager.adjustStockOnCloud(
-                        workerUrl = cloudflareWorkerUrl.value,
-                        userPhone = phone,
-                        productId = productId,
-                        productName = prod.name,
-                        newQuantity = afterQty,
-                        newAlertQuantity = prod.alertQuantity
-                    )
+                viewModelScope.launch {
+                    val ok = syncMutex.withLock {
+                        com.example.util.SyncManager.adjustStockOnCloud(
+                            workerUrl = cloudflareWorkerUrl.value,
+                            userPhone = phone,
+                            productId = productId,
+                            productName = prod.name,
+                            newQuantity = afterQty,
+                            newAlertQuantity = prod.alertQuantity
+                        )
+                    }
+                    if (ok) {
+                        repository.markProductsSynced(listOf(productId))
+                        removeManualStockAdjustment(productId)
+                    }
+                    triggerRealSync()
                 }
-                triggerRealSync()
             }
 
             val msg = if (adjustmentType == "STOCK_IN") {
@@ -2901,6 +2967,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 _isUploading.value = false
                 syncStatusMessage.value = result.message
                 if (result.success) {
+                    sharedPrefs.edit().putBoolean("pending_db_restore_mirror", false).apply()
+                    clearAllPendingDataAndFlags()
                     _isOfflineSaved.value = true
                     val now = System.currentTimeMillis()
                     lastSyncTime.value = now
@@ -2908,6 +2976,36 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 onResult(result.success, result.message)
             }
+        }
+    }
+
+    suspend fun mirrorLocalToCloudDirect(): Boolean {
+        val phone = getCloudPhone()
+        if (phone.isBlank() || isLoggingOutState) return false
+        if (!com.example.util.SyncManager.isNetworkAvailable(getApplication())) return false
+        val capturedToken = sessionToken
+        return syncMutex.withLock {
+            if (isLoggingOutState || capturedToken != sessionToken || sharedPrefs.getString("logged_in_phone", null).isNullOrBlank()) {
+                return@withLock false
+            }
+            _isUploading.value = true
+            syncStatusMessage.value = "Restored Database ကို Cloud ပေါ်သို့ Mirror တင်နေပါသည်..."
+            val result = com.example.util.SyncManager.mirrorLocalToCloud(
+                workerUrl = cloudflareWorkerUrl.value,
+                userPhone = phone,
+                repository = repository
+            )
+            if (result.success) {
+                sharedPrefs.edit().putBoolean("pending_db_restore_mirror", false).commit()
+                clearAllPendingDataAndFlags()
+                _isOfflineSaved.value = true
+                val now = System.currentTimeMillis()
+                lastSyncTime.value = now
+                sharedPrefs.edit().putLong("last_sync_time", now).apply()
+            }
+            _isUploading.value = false
+            syncStatusMessage.value = result.message
+            result.success
         }
     }
 
@@ -3053,11 +3151,12 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     suspend fun pullCloudDataDirect(phoneNo: String? = null): Boolean {
+        if (sharedPrefs.getBoolean("pending_db_restore_mirror", false)) return false
         val phone = getCloudPhone(phoneNo)
         if (phone.isBlank() || isLoggingOutState) return false
         val capturedToken = sessionToken
         return syncMutex.withLock {
-            if (isLoggingOutState || capturedToken != sessionToken || sharedPrefs.getString("logged_in_phone", null).isNullOrBlank()) {
+            if (isLoggingOutState || capturedToken != sessionToken || sharedPrefs.getString("logged_in_phone", null).isNullOrBlank() || sharedPrefs.getBoolean("pending_db_restore_mirror", false)) {
                 return@withLock false
             }
             val result = com.example.util.SyncManager.pullCloudData(

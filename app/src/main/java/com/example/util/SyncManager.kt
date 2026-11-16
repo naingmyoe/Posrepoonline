@@ -639,8 +639,8 @@ object SyncManager {
             val targetUrl = "$cleanUrl/api/sync/mirror"
             val conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
-            conn.connectTimeout = 15000
-            conn.readTimeout = 15000
+            conn.connectTimeout = 25000
+            conn.readTimeout = 60000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
             conn.doOutput = true
 
@@ -717,117 +717,123 @@ object SyncManager {
 
                 val cleanUrl = workerUrl.trim().removeSuffix("/")
 
-                // 1. Sync pending vouchers
+                // 1. Sync pending vouchers (chunked so large histories never time out or exhaust memory)
                 val unsyncedVouchers = repository.getUnsyncedCompletedVouchers()
                 if (unsyncedVouchers.isNotEmpty()) {
                     val targetUrl = "$cleanUrl/api/sync/vouchers"
-                    val conn = URL(targetUrl).openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.connectTimeout = 12000
-                    conn.readTimeout = 12000
-                    conn.setRequestProperty("Content-Type", "application/json; utf-8")
-                    conn.setRequestProperty("Accept", "application/json")
-                    conn.doOutput = true
+                    for (batch in unsyncedVouchers.chunked(150)) {
+                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn.requestMethod = "POST"
+                        conn.connectTimeout = 20000
+                        conn.readTimeout = 35000
+                        conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.setRequestProperty("Accept", "application/json")
+                        conn.doOutput = true
 
-                    val vouchersArray = JSONArray()
-                    val syncedIds = mutableListOf<String>()
+                        val vouchersArray = JSONArray()
+                        val syncedIds = mutableListOf<String>()
 
-                    for (v in unsyncedVouchers) {
-                        val items = repository.getVoucherItemsDirect(v.receiptNo)
-                        val vObj = JSONObject().apply {
-                            put("receiptNo", v.receiptNo)
-                            put("timestamp", v.timestamp)
-                            put("cashierName", v.cashierName)
-                            put("totalAmount", v.totalAmount)
-                            put("totalItems", v.totalItems)
-                            put("customerName", v.customerName)
-                            put("paymentMethod", v.paymentMethod)
-                            put("isCompleted", v.isCompleted)
-                            put("isPurchase", v.isPurchase)
-                            put("paidAmount", v.paidAmount)
-                            put("changeAmount", v.changeAmount)
-                            put("balanceAmount", v.balanceAmount)
-                            put("discount", v.discount)
-                            put("fee", v.fee)
-                        }
+                        for (v in batch) {
+                            val items = repository.getVoucherItemsDirect(v.receiptNo)
+                            val vObj = JSONObject().apply {
+                                put("receiptNo", v.receiptNo)
+                                put("timestamp", v.timestamp)
+                                put("cashierName", v.cashierName)
+                                put("totalAmount", v.totalAmount)
+                                put("totalItems", v.totalItems)
+                                put("customerName", v.customerName)
+                                put("paymentMethod", v.paymentMethod)
+                                put("isCompleted", v.isCompleted)
+                                put("isPurchase", v.isPurchase)
+                                put("paidAmount", v.paidAmount)
+                                put("changeAmount", v.changeAmount)
+                                put("balanceAmount", v.balanceAmount)
+                                put("discount", v.discount)
+                                put("fee", v.fee)
+                            }
 
-                        val itemsArr = JSONArray()
-                        for (it in items) {
-                            itemsArr.put(JSONObject().apply {
-                                put("productId", it.productId)
-                                put("productName", it.productName)
-                                put("quantity", it.quantity)
-                                put("purchasePrice", it.purchasePrice)
-                                put("sellingPrice", it.sellingPrice)
+                            val itemsArr = JSONArray()
+                            for (it in items) {
+                                itemsArr.put(JSONObject().apply {
+                                    put("productId", it.productId)
+                                    put("productName", it.productName)
+                                    put("quantity", it.quantity)
+                                    put("purchasePrice", it.purchasePrice)
+                                    put("sellingPrice", it.sellingPrice)
+                                })
+                            }
+
+                            vouchersArray.put(JSONObject().apply {
+                                put("voucher", vObj)
+                                put("items", itemsArr)
                             })
+                            syncedIds.add(v.receiptNo)
                         }
 
-                        vouchersArray.put(JSONObject().apply {
-                            put("voucher", vObj)
-                            put("items", itemsArr)
-                        })
-                        syncedIds.add(v.receiptNo)
-                    }
+                        val rootJson = JSONObject().apply {
+                            put("userPhone", userPhone)
+                            put("vouchers", vouchersArray)
+                        }
 
-                    val rootJson = JSONObject().apply {
-                        put("userPhone", userPhone)
-                        put("vouchers", vouchersArray)
-                    }
+                        OutputStreamWriter(conn.outputStream, "UTF-8").use { os ->
+                            os.write(rootJson.toString())
+                            os.flush()
+                        }
 
-                    OutputStreamWriter(conn.outputStream, "UTF-8").use { os ->
-                        os.write(rootJson.toString())
-                        os.flush()
-                    }
-
-                    val code = conn.responseCode
-                    if (code in 200..299) {
-                        repository.markVouchersSynced(syncedIds)
-                        syncedVouchersCount = syncedIds.size
+                        val code = conn.responseCode
+                        if (code in 200..299) {
+                            repository.markVouchersSynced(syncedIds)
+                            syncedVouchersCount += syncedIds.size
+                        }
                     }
                 }
 
-                // 2. Sync pending products (new products or updated prices)
+                // 2. Sync pending products (chunked for large catalogs)
                 val unsyncedProducts = repository.getUnsyncedProducts()
                 if (unsyncedProducts.isNotEmpty()) {
                     val targetUrl = "$cleanUrl/api/sync/products"
-                    val conn = URL(targetUrl).openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.connectTimeout = 10000
-                    conn.readTimeout = 10000
-                    conn.setRequestProperty("Content-Type", "application/json; utf-8")
-                    conn.doOutput = true
+                    for (batch in unsyncedProducts.chunked(250)) {
+                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn.requestMethod = "POST"
+                        conn.connectTimeout = 20000
+                        conn.readTimeout = 35000
+                        conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.doOutput = true
 
-                    val prodsArr = JSONArray()
-                    val pIds = mutableListOf<Long>()
-                    for (p in unsyncedProducts) {
-                        val isManual = (p.id in manualStockAdjustedProductIds)
-                        prodsArr.put(JSONObject().apply {
-                            put("id", p.id)
-                            put("name", p.name)
-                            put("groupName", p.groupName)
-                            put("purchasePrice", p.purchasePrice)
-                            put("sellingPrice", p.sellingPrice)
-                            put("unit", p.unit)
-                            put("barcode", p.barcode)
-                            put("quantity", p.quantity)
-                            put("alertQuantity", p.alertQuantity)
-                            if (isManual) {
-                                put("isManualStockAdjustment", true)
-                            }
-                        })
-                        pIds.add(p.id)
-                    }
+                        val prodsArr = JSONArray()
+                        val pIds = mutableListOf<Long>()
+                        for (p in batch) {
+                            val isManual = (p.id in manualStockAdjustedProductIds)
+                            prodsArr.put(JSONObject().apply {
+                                put("id", p.id)
+                                put("name", p.name)
+                                put("groupName", p.groupName)
+                                put("purchasePrice", p.purchasePrice)
+                                put("sellingPrice", p.sellingPrice)
+                                put("unit", p.unit)
+                                put("barcode", p.barcode)
+                                put("quantity", p.quantity)
+                                put("alertQuantity", p.alertQuantity)
+                                put("trackStock", p.trackStock)
+                                put("note", p.note)
+                                if (isManual) {
+                                    put("isManualStockAdjustment", true)
+                                }
+                            })
+                            pIds.add(p.id)
+                        }
 
-                    val payload = JSONObject().apply {
-                        put("userPhone", userPhone)
-                        put("products", prodsArr)
-                    }
+                        val payload = JSONObject().apply {
+                            put("userPhone", userPhone)
+                            put("products", prodsArr)
+                        }
 
-                    OutputStreamWriter(conn.outputStream, "UTF-8").use { it.write(payload.toString()) }
-                    val code = conn.responseCode
-                    if (code in 200..299) {
-                        repository.markProductsSynced(pIds)
-                        syncedProductsCount = pIds.size
+                        OutputStreamWriter(conn.outputStream, "UTF-8").use { it.write(payload.toString()) }
+                        val code = conn.responseCode
+                        if (code in 200..299) {
+                            repository.markProductsSynced(pIds)
+                            syncedProductsCount += pIds.size
+                        }
                     }
                 }
 
@@ -1068,8 +1074,8 @@ object SyncManager {
                 val targetUrl = workerUrl.trim().removeSuffix("/") + "/api/sync/pull"
                 val conn = URL(targetUrl).openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
-                conn.connectTimeout = 15000
-                conn.readTimeout = 15000
+                conn.connectTimeout = 20000
+                conn.readTimeout = 45000
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
                 conn.doOutput = true
@@ -1114,9 +1120,10 @@ object SyncManager {
                     }
                 }
 
-                // 2. Restore vouchers (supporting both camelCase and snake_case)
+                // Pre-parse vouchers before entering DB transaction
                 val vouchersArr = resObj.optJSONArray("vouchers") ?: JSONArray()
-                val cloudVoucherReceiptNos = mutableSetOf<String>()
+                val parsedVouchers = ArrayList<Voucher>(vouchersArr.length())
+                val cloudVoucherReceiptNos = HashSet<String>(vouchersArr.length() * 2)
                 for (i in 0 until vouchersArr.length()) {
                     val v = vouchersArr.getJSONObject(i)
                     val receiptNo = if (v.has("receiptNo")) v.optString("receiptNo") else v.optString("receipt_no")
@@ -1128,7 +1135,7 @@ object SyncManager {
                         val totItms = if (v.has("totalItems")) v.optInt("totalItems") else v.optInt("total_items", 0)
                         val cust = if (v.has("customerName")) v.optString("customerName") else v.optString("customer_name", "Not Register")
                         val payMethod = if (v.has("paymentMethod")) v.optString("paymentMethod") else v.optString("payment_method", "CASH")
-                        
+
                         val isComp = when {
                             v.has("isCompleted") -> v.optBoolean("isCompleted", true)
                             v.has("is_completed") -> v.optInt("is_completed", 1) == 1
@@ -1147,147 +1154,177 @@ object SyncManager {
                         val feeAmt = if (v.has("fee")) v.optDouble("fee") else 0.0
                         val vNote = v.optString("note", "")
 
-                        val voucher = Voucher(
-                            receiptNo = receiptNo,
-                            timestamp = ts,
-                            cashierName = cashier,
-                            totalAmount = totAmt,
-                            totalItems = totItms,
-                            customerName = cust,
-                            paymentMethod = payMethod,
-                            isCompleted = isComp,
-                            isPurchase = isPurch,
-                            paidAmount = paidAmt,
-                            changeAmount = changeAmt,
-                            balanceAmount = balAmt,
-                            discount = disc,
-                            fee = feeAmt,
-                            note = vNote,
-                            isSynced = true
+                        parsedVouchers.add(
+                            Voucher(
+                                receiptNo = receiptNo,
+                                timestamp = ts,
+                                cashierName = cashier,
+                                totalAmount = totAmt,
+                                totalItems = totItms,
+                                customerName = cust,
+                                paymentMethod = payMethod,
+                                isCompleted = isComp,
+                                isPurchase = isPurch,
+                                paidAmount = paidAmt,
+                                changeAmount = changeAmt,
+                                balanceAmount = balAmt,
+                                discount = disc,
+                                fee = feeAmt,
+                                note = vNote,
+                                isSynced = true
+                            )
                         )
+                    }
+                }
+
+                // Wrap all Room writes inside a single SQLite transaction to eliminate per-row Flow storms & ANRs
+                val prodsArr = resObj.optJSONArray("products") ?: JSONArray()
+                val custsArr = resObj.optJSONArray("customers") ?: JSONArray()
+                val groupsArr = resObj.optJSONArray("groups") ?: JSONArray()
+                val unitsArr = resObj.optJSONArray("units") ?: JSONArray()
+                val paymentsArr = resObj.optJSONArray("payments") ?: JSONArray()
+                val suppliersArr = resObj.optJSONArray("suppliers") ?: JSONArray()
+                val expCatsArr = resObj.optJSONArray("expenseCategories") ?: resObj.optJSONArray("expense_categories") ?: JSONArray()
+                val expensesArr = resObj.optJSONArray("expenses") ?: JSONArray()
+                val adjustmentsArr = resObj.optJSONArray("stockAdjustments") ?: JSONArray()
+
+                repository.runInTransaction {
+                    // 2. Restore vouchers
+                    for (voucher in parsedVouchers) {
                         repository.insertVoucher(voucher)
-                        repository.deleteVoucherItems(receiptNo)
-                        itemsMap[receiptNo]?.forEach { repository.insertVoucherItem(it) }
+                        repository.deleteVoucherItems(voucher.receiptNo)
+                        itemsMap[voucher.receiptNo]?.forEach { repository.insertVoucherItem(it) }
                         vCount++
                     }
-                }
 
-                // Multi-device voucher deletion sync: delete local synced vouchers that were deleted on another phone or cloud
-                val allLocalVouchers = repository.getAllVouchersDirect()
-                for (lv in allLocalVouchers) {
-                    if (lv.isSynced && lv.receiptNo !in cloudVoucherReceiptNos) {
-                        repository.deleteVoucher(lv.receiptNo)
-                        repository.deleteVoucherItems(lv.receiptNo)
-                    }
-                }
-                onProgress(0.65f, "ဘောက်ချာမှတ်တမ်းများ ထည့်သွင်းပြီးပါပြီ...")
-
-                // 3. Restore products (real-time stock/metadata sync & multi-device deletion sync)
-                // Calculate any locally unsynced / pending completed sales or purchases
-                // Formula: remaining stock = cloud database stock - offline sold stock + offline purchase stock
-                val pendingVouchers = repository.getUnsyncedCompletedVouchers()
-                val pendingSoldById = mutableMapOf<Long, Int>()
-                val pendingSoldByName = mutableMapOf<String, Int>()
-                val pendingPurchasedById = mutableMapOf<Long, Int>()
-                val pendingPurchasedByName = mutableMapOf<String, Int>()
-
-                for (pv in pendingVouchers) {
-                    val items = repository.getVoucherItemsDirect(pv.receiptNo)
-                    for (it in items) {
-                        val q = it.quantity
-                        if (pv.isPurchase) {
-                            if (it.productId > 0) pendingPurchasedById[it.productId] = (pendingPurchasedById[it.productId] ?: 0) + q
-                            if (it.productName.isNotBlank()) pendingPurchasedByName[it.productName.trim().lowercase()] = (pendingPurchasedByName[it.productName.trim().lowercase()] ?: 0) + q
-                        } else {
-                            if (it.productId > 0) pendingSoldById[it.productId] = (pendingSoldById[it.productId] ?: 0) + q
-                            if (it.productName.isNotBlank()) pendingSoldByName[it.productName.trim().lowercase()] = (pendingSoldByName[it.productName.trim().lowercase()] ?: 0) + q
+                    // Multi-device voucher deletion sync: delete local synced vouchers that were deleted on another phone or cloud
+                    val allLocalVouchers = repository.getAllVouchersDirect()
+                    for (lv in allLocalVouchers) {
+                        if (lv.isSynced && lv.receiptNo !in cloudVoucherReceiptNos) {
+                            repository.deleteVoucher(lv.receiptNo)
+                            repository.deleteVoucherItems(lv.receiptNo)
                         }
                     }
-                }
+                    onProgress(0.65f, "ဘောက်ချာမှတ်တမ်းများ ထည့်သွင်းပြီးပါပြီ...")
 
-                val prodsArr = resObj.optJSONArray("products") ?: JSONArray()
-                val cloudProductIds = mutableSetOf<Long>()
-                val cloudProductNames = mutableSetOf<String>()
-                val currentLocalProds = repository.getAllProductsDirect()
-                val localProdsByName = currentLocalProds.associateBy { it.name.trim().lowercase() }.toMutableMap()
-                val localProdsById = currentLocalProds.filter { it.id > 0 }.associateBy { it.id }.toMutableMap()
+                    // 3. Restore products (real-time stock/metadata sync & multi-device deletion sync)
+                    val pendingVouchers = repository.getUnsyncedCompletedVouchers()
+                    val pendingSoldById = mutableMapOf<Long, Int>()
+                    val pendingSoldByName = mutableMapOf<String, Int>()
+                    val pendingPurchasedById = mutableMapOf<Long, Int>()
+                    val pendingPurchasedByName = mutableMapOf<String, Int>()
 
-                for (i in 0 until prodsArr.length()) {
-                    val p = prodsArr.getJSONObject(i)
-                    val prodId = if (p.has("id")) p.optLong("id") else p.optLong("product_id", 0L)
-                    val pName = p.optString("name").trim()
-                    if (pName.isBlank()) continue
-                    val normName = pName.lowercase()
-                    if (prodId > 0) cloudProductIds.add(prodId)
-                    cloudProductNames.add(normName)
-
-                    val gName = if (p.has("groupName")) p.optString("groupName") else p.optString("group_name", "Default")
-                    val pPrice = if (p.has("purchasePrice")) p.optDouble("purchasePrice") else p.optDouble("purchase_price", 0.0)
-                    val sPrice = if (p.has("sellingPrice")) p.optDouble("sellingPrice") else p.optDouble("selling_price", 0.0)
-                    val aQty = if (p.has("alertQuantity")) p.optInt("alertQuantity") else p.optInt("alert_quantity", 0)
-                    val track = if (p.has("trackStock")) p.optBoolean("trackStock") else true
-                    val barcode = p.optString("barcode", "")
-                    val unit = p.optString("unit", "ခု")
-                    val note = p.optString("note", "")
-                    val cloudQty = p.optInt("quantity", 0)
-
-                    // Relative offline reconciliation: remain stock = cloud database stock - pending offline sold stock
-                    val pSold = (if (prodId > 0) pendingSoldById[prodId] else null) ?: pendingSoldByName[normName] ?: 0
-                    val pPurchased = (if (prodId > 0) pendingPurchasedById[prodId] else null) ?: pendingPurchasedByName[normName] ?: 0
-                    val finalQty = if (pSold > 0 || pPurchased > 0) {
-                        (cloudQty + pPurchased - pSold).coerceAtLeast(0)
-                    } else {
-                        cloudQty
+                    for (pv in pendingVouchers) {
+                        val items = repository.getVoucherItemsDirect(pv.receiptNo)
+                        for (it in items) {
+                            val q = it.quantity
+                            if (pv.isPurchase) {
+                                if (it.productId > 0) pendingPurchasedById[it.productId] = (pendingPurchasedById[it.productId] ?: 0) + q
+                                if (it.productName.isNotBlank()) pendingPurchasedByName[it.productName.trim().lowercase()] = (pendingPurchasedByName[it.productName.trim().lowercase()] ?: 0) + q
+                            } else {
+                                if (it.productId > 0) pendingSoldById[it.productId] = (pendingSoldById[it.productId] ?: 0) + q
+                                if (it.productName.isNotBlank()) pendingSoldByName[it.productName.trim().lowercase()] = (pendingSoldByName[it.productName.trim().lowercase()] ?: 0) + q
+                            }
+                        }
                     }
-                    val hasPendingDeltas = (pSold > 0 || pPurchased > 0)
 
-                    val existing = (if (prodId > 0) localProdsById[prodId] else null) ?: localProdsByName[normName]
-                    if (existing != null) {
-                        val updated = existing.copy(
-                            name = pName,
-                            groupName = gName,
-                            purchasePrice = pPrice,
-                            sellingPrice = sPrice,
-                            unit = unit,
-                            note = note,
-                            trackStock = track,
-                            barcode = barcode,
-                            quantity = finalQty,
-                            alertQuantity = aQty,
-                            isSynced = !hasPendingDeltas
-                        )
-                        repository.updateProduct(updated)
-                    } else {
-                        val prod = Product(
-                            id = prodId,
-                            name = pName,
-                            groupName = gName,
-                            purchasePrice = pPrice,
-                            sellingPrice = sPrice,
-                            unit = unit,
-                            note = note,
-                            trackStock = track,
-                            barcode = barcode,
-                            quantity = finalQty,
-                            alertQuantity = aQty,
-                            isSynced = !hasPendingDeltas
-                        )
-                        repository.insertProduct(prod)
+                    val cloudProductIds = mutableSetOf<Long>()
+                    val cloudProductNames = mutableSetOf<String>()
+                    val currentLocalProds = repository.getAllProductsDirect()
+                    val localProdsByName = currentLocalProds.associateBy { it.name.trim().lowercase() }.toMutableMap()
+                    val localProdsById = currentLocalProds.filter { it.id > 0 }.associateBy { it.id }.toMutableMap()
+
+                    for (i in 0 until prodsArr.length()) {
+                        val p = prodsArr.getJSONObject(i)
+                        val prodId = if (p.has("id")) p.optLong("id") else p.optLong("product_id", 0L)
+                        val pName = p.optString("name").trim()
+                        if (pName.isBlank()) continue
+                        val normName = pName.lowercase()
+                        if (prodId > 0) cloudProductIds.add(prodId)
+                        cloudProductNames.add(normName)
+
+                        val gName = if (p.has("groupName")) p.optString("groupName") else p.optString("group_name", "Default")
+                        val pPrice = if (p.has("purchasePrice")) p.optDouble("purchasePrice") else p.optDouble("purchase_price", 0.0)
+                        val sPrice = if (p.has("sellingPrice")) p.optDouble("sellingPrice") else p.optDouble("selling_price", 0.0)
+                        val aQty = if (p.has("alertQuantity")) p.optInt("alertQuantity") else p.optInt("alert_quantity", 0)
+                        val track = if (p.has("trackStock")) p.optBoolean("trackStock") else true
+                        val barcode = p.optString("barcode", "")
+                        val unit = p.optString("unit", "ခု")
+                        val note = p.optString("note", "")
+                        val cloudQty = p.optInt("quantity", 0)
+
+                        // Relative offline reconciliation: remain stock = cloud database stock - pending offline sold stock
+                        val pSold = (if (prodId > 0) pendingSoldById[prodId] else null) ?: pendingSoldByName[normName] ?: 0
+                        val pPurchased = (if (prodId > 0) pendingPurchasedById[prodId] else null) ?: pendingPurchasedByName[normName] ?: 0
+                        val finalQty = if (pSold > 0 || pPurchased > 0) {
+                            (cloudQty + pPurchased - pSold).coerceAtLeast(0)
+                        } else {
+                            cloudQty
+                        }
+                        val hasPendingDeltas = (pSold > 0 || pPurchased > 0)
+
+                        // Avoid ID-shift collisions across DB restores: prefer matching same name if ID points to a different item
+                        val byId = if (prodId > 0) localProdsById[prodId] else null
+                        val byName = localProdsByName[normName]
+                        val existing = if (byId != null && (byId.name.trim().lowercase() == normName || byName == null)) {
+                            byId
+                        } else {
+                            byName ?: byId
+                        }
+
+                        if (existing != null) {
+                            val updated = existing.copy(
+                                name = pName,
+                                groupName = gName,
+                                purchasePrice = pPrice,
+                                sellingPrice = sPrice,
+                                unit = unit,
+                                note = note,
+                                trackStock = track,
+                                barcode = barcode,
+                                quantity = finalQty,
+                                alertQuantity = aQty,
+                                isSynced = !hasPendingDeltas
+                            )
+                            repository.updateProduct(updated)
+                            localProdsByName[normName] = updated
+                            if (updated.id > 0) localProdsById[updated.id] = updated
+                        } else {
+                            val safeNewId = if (prodId > 0 && localProdsById[prodId] == null) prodId else 0L
+                            val prod = Product(
+                                id = safeNewId,
+                                name = pName,
+                                groupName = gName,
+                                purchasePrice = pPrice,
+                                sellingPrice = sPrice,
+                                unit = unit,
+                                note = note,
+                                trackStock = track,
+                                barcode = barcode,
+                                quantity = finalQty,
+                                alertQuantity = aQty,
+                                isSynced = !hasPendingDeltas
+                            )
+                            val insertedId = repository.insertProduct(prod)
+                            val saved = prod.copy(id = insertedId)
+                            localProdsByName[normName] = saved
+                            if (insertedId > 0) localProdsById[insertedId] = saved
+                        }
+                        pCount++
                     }
-                    pCount++
-                }
 
-                // Multi-device deletion sync: delete local products that were deleted on another phone
-                val refreshedProds = repository.getAllProductsDirect()
-                for (lp in refreshedProds) {
-                    if (lp.isSynced) {
-                        val inCloud = (lp.id > 0 && lp.id in cloudProductIds) || (lp.name.trim().lowercase() in cloudProductNames)
-                        if (!inCloud) {
+                    // Multi-device deletion sync: delete local products that were deleted on another phone (or replaced by name after restore)
+                    val refreshedProds = repository.getAllProductsDirect()
+                    val seenLocalNames = HashSet<String>()
+                    for (lp in refreshedProds) {
+                        val lpNorm = lp.name.trim().lowercase()
+                        val inCloud = lpNorm in cloudProductNames || (lp.id > 0 && lp.id in cloudProductIds && lpNorm in cloudProductNames)
+                        val isDupName = !seenLocalNames.add(lpNorm)
+                        if (lp.isSynced && (!inCloud || isDupName)) {
                             repository.deleteProduct(lp)
                         }
                     }
-                }
-                onProgress(0.85f, "ကုန်ပစ္စည်းနှင့် Stock လက်ကျန်များ ထည့်သွင်းပြီးပါပြီ...")
+                    onProgress(0.85f, "ကုန်ပစ္စည်းနှင့် Stock လက်ကျန်များ ထည့်သွင်းပြီးပါပြီ...")
 
                 // 4. Restore customers (deduplicated by name and cleans up existing duplicates in local Room, with multi-device deletion sync)
                 val currentLocalCustomers = repository.getAllCustomersDirect()
@@ -1311,13 +1348,11 @@ object SyncManager {
                 for (norm in pendingDeletedCustomers) {
                     deletedCustomersFromCloud.add(norm.trim().lowercase())
                 }
-                for ((norm, c) in localCustomersByName) {
-                    if (norm in deletedCustomersFromCloud || c.name.trim().lowercase() in deletedCustomersFromCloud || c.id.toString() in deletedCustomersFromCloud) {
-                        repository.deleteCustomer(c)
+                    for ((norm, c) in localCustomersByName) {
+                        if (norm in deletedCustomersFromCloud || c.name.trim().lowercase() in deletedCustomersFromCloud || c.id.toString() in deletedCustomersFromCloud) {
+                            repository.deleteCustomer(c)
+                        }
                     }
-                }
-
-                val custsArr = resObj.optJSONArray("customers") ?: JSONArray()
                 for (i in 0 until custsArr.length()) {
                     val c = custsArr.getJSONObject(i)
                     val cName = c.optString("name").trim()
@@ -1507,7 +1542,6 @@ object SyncManager {
                 }
 
                 // 9. Restore expense categories (deduplicated by name)
-                val expCatsArr = resObj.optJSONArray("expenseCategories") ?: resObj.optJSONArray("expense_categories") ?: JSONArray()
                 val currentCats = repository.getAllExpenseCategoriesDirect()
                 val seenCatNames = currentCats.map { it.name.trim().lowercase() }.toMutableSet()
                 for (i in 0 until expCatsArr.length()) {
@@ -1523,9 +1557,12 @@ object SyncManager {
                     }
                 }
 
-                // 10. Restore expenses (deduplicated)
-                val expensesArr = resObj.optJSONArray("expenses") ?: JSONArray()
+                // 10. Restore expenses (O(1) deduplicated lookup)
                 val currentExpenses = repository.getAllExpensesDirect()
+                val existingExpenseKeys = HashSet<String>(currentExpenses.size * 2)
+                for (ex in currentExpenses) {
+                    existingExpenseKeys.add("${ex.timestamp}::${ex.amount}::${ex.description}")
+                }
                 var restoredExpensesCount = 0
                 for (i in 0 until expensesArr.length()) {
                     val exp = expensesArr.getJSONObject(i)
@@ -1538,8 +1575,8 @@ object SyncManager {
                     val dStr = if (exp.has("dateString")) exp.optString("dateString") else exp.optString("date_string", "")
                     val tStr = if (exp.has("timeString")) exp.optString("timeString") else exp.optString("time_string", "")
 
-                    val isDup = currentExpenses.any { it.timestamp == ts && it.amount == amt && it.description == desc }
-                    if (!isDup && (catName.isNotBlank() || desc.isNotBlank())) {
+                    val key = "$ts::$amt::$desc"
+                    if (existingExpenseKeys.add(key) && (catName.isNotBlank() || desc.isNotBlank())) {
                         repository.insertExpense(Expense(
                             categoryName = catName,
                             description = desc,
@@ -1554,15 +1591,18 @@ object SyncManager {
                     }
                 }
 
-                // 11. Restore stock adjustments (deduplicated)
-                val adjustmentsArr = resObj.optJSONArray("stockAdjustments") ?: JSONArray()
+                // 11. Restore stock adjustments (O(1) deduplicated lookup)
                 val currentAdjustments = repository.getAllStockAdjustmentsDirect()
-                val localProds = repository.getAllProductsDirect()
+                val existingAdjKeys = HashSet<String>(currentAdjustments.size * 2)
+                for (adj in currentAdjustments) {
+                    existingAdjKeys.add("${adj.timestamp}::${adj.productName.trim().lowercase()}::${adj.adjustmentType}::${adj.quantity}")
+                }
+                val adjProdsByName = repository.getAllProductsDirect().associateBy { it.name.trim().lowercase() }
                 for (i in 0 until adjustmentsArr.length()) {
                     val sa = adjustmentsArr.getJSONObject(i)
                     val pName = sa.optString("productName", "")
                     val rawPid = sa.optLong("productId", 0L)
-                    val matchedPid = localProds.find { it.name.equals(pName, ignoreCase = true) }?.id ?: rawPid
+                    val matchedPid = adjProdsByName[pName.trim().lowercase()]?.id ?: rawPid
                     val adjType = sa.optString("adjustmentType", "STOCK_OUT")
                     val rTitle = sa.optString("reasonTitle", "")
                     val desc = sa.optString("description", "")
@@ -1572,10 +1612,8 @@ object SyncManager {
                     val ts = sa.optLong("timestamp", System.currentTimeMillis())
                     val adjBy = sa.optString("adjustedBy", "")
 
-                    val isDup = currentAdjustments.any {
-                        it.timestamp == ts && it.productName.equals(pName, ignoreCase = true) && it.adjustmentType == adjType && it.quantity == qty
-                    }
-                    if (!isDup && pName.isNotBlank() && qty > 0) {
+                    val adjKey = "$ts::${pName.trim().lowercase()}::$adjType::$qty"
+                    if (pName.isNotBlank() && qty > 0 && existingAdjKeys.add(adjKey)) {
                         repository.insertStockAdjustment(
                             StockAdjustment(
                                 productId = matchedPid,
@@ -1593,6 +1631,7 @@ object SyncManager {
                         )
                     }
                 }
+                } // end runInTransaction
 
                 onProgress(1.0f, "ဒေတာများ အောင်မြင်စွာ ပြန်လည်ရယူပြီးပါပြီ။")
 

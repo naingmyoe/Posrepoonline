@@ -146,6 +146,29 @@ fun SASLogo(modifier: Modifier = Modifier, size: Dp = 80.dp) {
 }
 
 @Composable
+fun ProductAsyncThumbnail(
+    imageUri: String,
+    contentDescription: String,
+    modifier: Modifier = Modifier,
+    maxSizePx: Int = 320
+) {
+    val context = LocalContext.current
+    val request = remember(imageUri, maxSizePx) {
+        coil.request.ImageRequest.Builder(context)
+            .data(imageUri)
+            .size(maxSizePx)
+            .crossfade(false)
+            .build()
+    }
+    coil.compose.AsyncImage(
+        model = request,
+        contentDescription = contentDescription,
+        modifier = modifier,
+        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+    )
+}
+
+@Composable
 fun SplashScreen(navController: NavController, viewModel: POSViewModel) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("pos_prefs", android.content.Context.MODE_PRIVATE) }
@@ -198,21 +221,39 @@ fun SplashScreen(navController: NavController, viewModel: POSViewModel) {
                     if (isAccessAllowed) {
                         sharedPrefs.edit().putString("last_checked_date", todayStr).apply()
                         val cloudOwner = viewModel.getCloudPhone(loggedPhone)
+                        val pendingRestoreMirror = sharedPrefs.getBoolean("pending_db_restore_mirror", false)
                         val lastDataOwner = sharedPrefs.getString("data_owner_phone", "") ?: ""
-                        if (lastDataOwner != cloudOwner) {
-                            viewModel.clearAllBusinessData()
-                        }
 
-                        // Fast launch into dashboard!
-                        val isDbEmpty = viewModel.isLocalDataEmpty()
-                        if (isDbEmpty || lastDataOwner != cloudOwner) {
-                            viewModel.pullCloudDataDirect(cloudOwner)
-                        } else {
-                            scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                        if (pendingRestoreMirror) {
+                            sharedPrefs.edit().putString("data_owner_phone", cloudOwner).commit()
+                            val isDbEmpty = viewModel.isLocalDataEmpty()
+                            if (isDbEmpty) {
+                                sharedPrefs.edit().putBoolean("pending_db_restore_mirror", false).commit()
                                 viewModel.pullCloudDataDirect(cloudOwner)
+                            } else {
+                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                    val mirrored = viewModel.mirrorLocalToCloudDirect()
+                                    if (mirrored) {
+                                        viewModel.pullCloudDataDirect(cloudOwner)
+                                    }
+                                }
                             }
+                        } else {
+                            if (lastDataOwner != cloudOwner) {
+                                viewModel.clearAllBusinessData()
+                            }
+
+                            // Fast launch into dashboard!
+                            val isDbEmpty = viewModel.isLocalDataEmpty()
+                            if (isDbEmpty || lastDataOwner != cloudOwner) {
+                                viewModel.pullCloudDataDirect(cloudOwner)
+                            } else {
+                                scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                    viewModel.pullCloudDataDirect(cloudOwner)
+                                }
+                            }
+                            sharedPrefs.edit().putString("data_owner_phone", cloudOwner).apply()
                         }
-                        sharedPrefs.edit().putString("data_owner_phone", cloudOwner).apply()
 
                         navController.navigate("dashboard") {
                             popUpTo("splash") { inclusive = true }
@@ -247,12 +288,21 @@ fun SplashScreen(navController: NavController, viewModel: POSViewModel) {
                     val cloudOwner = viewModel.getCloudPhone(loggedPhone)
                     if (viewModel.isInternetAvailable(context)) {
                         scope.launch(kotlinx.coroutines.Dispatchers.IO) {
-                            val lastDataOwner = sharedPrefs.getString("data_owner_phone", "") ?: ""
-                            if (lastDataOwner != cloudOwner) {
-                                viewModel.clearAllBusinessData()
+                            val pendingRestoreMirror = sharedPrefs.getBoolean("pending_db_restore_mirror", false)
+                            if (pendingRestoreMirror) {
+                                sharedPrefs.edit().putString("data_owner_phone", cloudOwner).commit()
+                                val mirrored = viewModel.mirrorLocalToCloudDirect()
+                                if (mirrored) {
+                                    viewModel.pullCloudDataDirect(cloudOwner)
+                                }
+                            } else {
+                                val lastDataOwner = sharedPrefs.getString("data_owner_phone", "") ?: ""
+                                if (lastDataOwner != cloudOwner) {
+                                    viewModel.clearAllBusinessData()
+                                }
+                                viewModel.pullCloudDataDirect(cloudOwner)
+                                sharedPrefs.edit().putString("data_owner_phone", cloudOwner).apply()
                             }
-                            viewModel.pullCloudDataDirect(cloudOwner)
-                            sharedPrefs.edit().putString("data_owner_phone", cloudOwner).apply()
                         }
                     }
                     navController.navigate("dashboard") {
@@ -4027,6 +4077,14 @@ fun ProductsListScreen(navController: NavController, viewModel: POSViewModel) {
     val isCashier = (currentUser?.role ?: cachedRole) == "CASHIER"
     val isUploading by viewModel.isUploading.collectAsState()
 
+    LaunchedEffect(Unit) {
+        if (viewModel.isInternetAvailable(context) && !sharedPrefs.getBoolean("pending_db_restore_mirror", false)) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                viewModel.pullCloudDataDirect()
+            }
+        }
+    }
+
     val screenTitle = when (stockReportMode) {
         "PURCHASE_VALUE" -> "ကုန်ပစ္စည်းလက်ကျန်အဝယ်တန်ဖိုး"
         "SELLING_VALUE" -> "ကုန်ပစ္စည်းလက်ကျန်ရောင်းတန်ဖိုး"
@@ -4352,11 +4410,11 @@ fun ProductsListScreen(navController: NavController, viewModel: POSViewModel) {
                                 ) {
                                     Box(modifier = Modifier.fillMaxSize()) {
                                         if (product.imageUri.isNotEmpty()) {
-                                            coil.compose.AsyncImage(
-                                                model = product.imageUri,
+                                            ProductAsyncThumbnail(
+                                                imageUri = product.imageUri,
                                                 contentDescription = product.name,
                                                 modifier = Modifier.fillMaxSize(),
-                                                contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                                maxSizePx = 320
                                             )
                                         } else {
                                             Box(
@@ -5782,11 +5840,11 @@ fun AddProductScreen(navController: NavController, viewModel: POSViewModel) {
                             contentAlignment = Alignment.Center
                         ) {
                             if (prodImageUri.isNotEmpty()) {
-                                coil.compose.AsyncImage(
-                                    model = prodImageUri,
+                                ProductAsyncThumbnail(
+                                    imageUri = prodImageUri,
                                     contentDescription = "Product Image",
                                     modifier = Modifier.fillMaxSize(),
-                                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                    maxSizePx = 320
                                 )
                             } else {
                                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -7473,6 +7531,15 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
     val editingVoucher by viewModel.editingVoucher.collectAsState()
     val numberFormat = remember { NumberFormat.getNumberInstance(Locale.US) }
 
+    LaunchedEffect(Unit) {
+        val prefs = context.getSharedPreferences("pos_prefs", android.content.Context.MODE_PRIVATE)
+        if (viewModel.isInternetAvailable(context) && !prefs.getBoolean("pending_db_restore_mirror", false)) {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                viewModel.pullCloudDataDirect()
+            }
+        }
+    }
+
     LaunchedEffect(activeVoucherId) {
         val currentId = activeVoucherId
         if (currentId != null) {
@@ -7872,7 +7939,7 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                                     verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
-                                    items(displayedProducts) { prod ->
+                                    items(displayedProducts, key = { it.id }) { prod ->
                                         val cartItem = cart.find { it.product.id == prod.id }
                                         val cartQty = cartItem?.quantity ?: 0
                                         
@@ -7920,11 +7987,11 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                         ) {
                                             Box(modifier = Modifier.fillMaxSize()) {
                                                 if (prod.imageUri.isNotEmpty()) {
-                                                    coil.compose.AsyncImage(
-                                                        model = prod.imageUri,
+                                                    ProductAsyncThumbnail(
+                                                        imageUri = prod.imageUri,
                                                         contentDescription = prod.name,
                                                         modifier = Modifier.fillMaxSize(),
-                                                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                                        maxSizePx = 320
                                                     )
                                                 } else {
                                                     Box(
@@ -7989,7 +8056,7 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                         .fillMaxWidth()
                                         .weight(1f)
                                 ) {
-                                    items(displayedProducts) { prod ->
+                                    items(displayedProducts, key = { it.id }) { prod ->
                                         val cartItem = cart.find { it.product.id == prod.id }
                                         val cartQty = cartItem?.quantity ?: 0
 
@@ -8049,11 +8116,11 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                                     contentAlignment = Alignment.Center
                                                 ) {
                                                     if (prod.imageUri.isNotEmpty()) {
-                                                        coil.compose.AsyncImage(
-                                                            model = prod.imageUri,
+                                                        ProductAsyncThumbnail(
+                                                            imageUri = prod.imageUri,
                                                             contentDescription = prod.name,
                                                             modifier = Modifier.fillMaxSize(),
-                                                            contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                                            maxSizePx = 160
                                                         )
                                                     } else {
                                                         Icon(
@@ -9825,7 +9892,7 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                                 verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                items(displayedProducts) { prod ->
+                                items(displayedProducts, key = { it.id }) { prod ->
                                     val cartItem = cart.find { it.product.id == prod.id }
                                     val cartQty = cartItem?.quantity ?: 0
                                     
@@ -9873,11 +9940,11 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                     ) {
                                         Box(modifier = Modifier.fillMaxSize()) {
                                             if (prod.imageUri.isNotEmpty()) {
-                                                coil.compose.AsyncImage(
-                                                    model = prod.imageUri,
+                                                ProductAsyncThumbnail(
+                                                    imageUri = prod.imageUri,
                                                     contentDescription = prod.name,
                                                     modifier = Modifier.fillMaxSize(),
-                                                    contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                                    maxSizePx = 320
                                                 )
                                             } else {
                                                 Box(
@@ -9942,7 +10009,7 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                     .fillMaxWidth()
                                     .weight(1f)
                             ) {
-                                items(displayedProducts) { prod ->
+                                items(displayedProducts, key = { it.id }) { prod ->
                                     val cartItem = cart.find { it.product.id == prod.id }
                                     val cartQty = cartItem?.quantity ?: 0
 
@@ -10002,11 +10069,11 @@ fun NewVoucherScreen(navController: NavController, viewModel: POSViewModel) {
                                                 contentAlignment = Alignment.Center
                                             ) {
                                                 if (prod.imageUri.isNotEmpty()) {
-                                                    coil.compose.AsyncImage(
-                                                        model = prod.imageUri,
+                                                    ProductAsyncThumbnail(
+                                                        imageUri = prod.imageUri,
                                                         contentDescription = prod.name,
                                                         modifier = Modifier.fillMaxSize(),
-                                                        contentScale = androidx.compose.ui.layout.ContentScale.Crop
+                                                        maxSizePx = 160
                                                     )
                                                 } else {
                                                     Icon(
@@ -13430,6 +13497,7 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
     val cachedRole = remember(activePhone) { sharedPrefs.getString("user_role_$activePhone", "") ?: "" }
     val isCashier = (currentUser?.role ?: cachedRole) == "CASHIER"
     val logoUri by viewModel.headerLogoUri.collectAsState()
+    val settingsCoroutineScope = rememberCoroutineScope()
 
     var showRestoreConfirmDialog by remember { mutableStateOf(false) }
 
@@ -13480,6 +13548,7 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
                 }
 
                 // Inspect restored DB file to auto-recover user account phone into sharedPrefs
+                var restoredPhoneVal: String? = null
                 try {
                     val sqliteDb = android.database.sqlite.SQLiteDatabase.openDatabase(
                         dbFile.path,
@@ -13488,17 +13557,23 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
                     )
                     val cursor = sqliteDb.rawQuery("SELECT phoneNo FROM user_accounts ORDER BY id DESC LIMIT 1", null)
                     if (cursor.moveToFirst()) {
-                        val restoredPhone = cursor.getString(0)
-                        if (!restoredPhone.isNullOrEmpty()) {
-                            sharedPrefs.edit()
-                                .putString("logged_in_phone", restoredPhone)
-                                .putString("last_registered_phone", restoredPhone)
-                                .apply()
+                        val candidate = cursor.getString(0)
+                        if (!candidate.isNullOrEmpty()) {
+                            restoredPhoneVal = candidate
                         }
                     }
                     cursor.close()
                     sqliteDb.close()
                 } catch (_: Exception) {}
+
+                val prefsEditor = sharedPrefs.edit().putBoolean("pending_db_restore_mirror", true)
+                if (!restoredPhoneVal.isNullOrEmpty()) {
+                    prefsEditor
+                        .putString("logged_in_phone", restoredPhoneVal)
+                        .putString("last_registered_phone", restoredPhoneVal)
+                        .putString("data_owner_phone", restoredPhoneVal)
+                }
+                prefsEditor.commit()
 
                 Toast.makeText(context, "Database restore successful! Restarting app...", Toast.LENGTH_LONG).show()
                 val intent = context.packageManager.getLaunchIntentForPackage(context.packageName)
@@ -13520,8 +13595,12 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
         contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val count = com.example.util.BackupAndExcelUtils.importProductsFromCSV(context, uri, viewModel)
-            Toast.makeText(context, "Excel Import Successful: $count products imported!", Toast.LENGTH_LONG).show()
+            settingsCoroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val count = com.example.util.BackupAndExcelUtils.importProductsFromCSV(context, uri, viewModel)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "Excel Import Successful: $count products imported!", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -13529,8 +13608,12 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
         contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val count = com.example.util.BackupAndExcelUtils.importCustomersFromCSV(context, uri, viewModel)
-            Toast.makeText(context, "Excel Import Successful: $count customers imported!", Toast.LENGTH_LONG).show()
+            settingsCoroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val count = com.example.util.BackupAndExcelUtils.importCustomersFromCSV(context, uri, viewModel)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "Excel Import Successful: $count customers imported!", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -13538,8 +13621,12 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
         contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val count = com.example.util.BackupAndExcelUtils.importSuppliersFromCSV(context, uri, viewModel)
-            Toast.makeText(context, "Excel Import Successful: $count suppliers imported!", Toast.LENGTH_LONG).show()
+            settingsCoroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val count = com.example.util.BackupAndExcelUtils.importSuppliersFromCSV(context, uri, viewModel)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "Excel Import Successful: $count suppliers imported!", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -13547,8 +13634,12 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
         contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val count = com.example.util.BackupAndExcelUtils.importSalesFromCSV(context, uri, viewModel)
-            Toast.makeText(context, "Excel Import Successful: $count sale vouchers imported!", Toast.LENGTH_LONG).show()
+            settingsCoroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val count = com.example.util.BackupAndExcelUtils.importSalesFromCSV(context, uri, viewModel)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "Excel Import Successful: $count sale vouchers imported!", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -13556,8 +13647,12 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
         contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val count = com.example.util.BackupAndExcelUtils.importExpensesFromCSV(context, uri, viewModel)
-            Toast.makeText(context, "Excel Import Successful: $count expenses imported!", Toast.LENGTH_LONG).show()
+            settingsCoroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val count = com.example.util.BackupAndExcelUtils.importExpensesFromCSV(context, uri, viewModel)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "Excel Import Successful: $count expenses imported!", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -13565,8 +13660,12 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
         contract = androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            val count = com.example.util.BackupAndExcelUtils.importPurchasesFromCSV(context, uri, viewModel)
-            Toast.makeText(context, "Excel Import Successful: $count purchase vouchers imported!", Toast.LENGTH_LONG).show()
+            settingsCoroutineScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                val count = com.example.util.BackupAndExcelUtils.importPurchasesFromCSV(context, uri, viewModel)
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                    Toast.makeText(context, "Excel Import Successful: $count purchase vouchers imported!", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
     

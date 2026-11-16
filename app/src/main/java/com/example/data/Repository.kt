@@ -1,9 +1,13 @@
 package com.example.data
 
+import androidx.room.withTransaction
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 
 class Repository(private val db: AppDatabase) {
+    suspend fun runInTransaction(block: suspend () -> Unit) {
+        db.withTransaction { block() }
+    }
     val allAccounts: Flow<List<UserAccount>> = db.userAccountDao().getAllAccountsFlow()
     val allProducts: Flow<List<Product>> = db.productDao().getAllProductsFlow()
     val allGroups: Flow<List<ProductGroup>> = db.productGroupDao().getAllGroupsFlow()
@@ -146,7 +150,9 @@ class Repository(private val db: AppDatabase) {
 
     suspend fun markVouchersSynced(receiptNos: List<String>) {
         if (receiptNos.isNotEmpty()) {
-            db.voucherDao().markVouchersSynced(receiptNos)
+            receiptNos.chunked(500).forEach { chunk ->
+                db.voucherDao().markVouchersSynced(chunk)
+            }
         }
     }
 
@@ -156,7 +162,9 @@ class Repository(private val db: AppDatabase) {
 
     suspend fun markProductsSynced(ids: List<Long>) {
         if (ids.isNotEmpty()) {
-            db.productDao().markProductsSynced(ids)
+            ids.chunked(500).forEach { chunk ->
+                db.productDao().markProductsSynced(chunk)
+            }
         }
     }
 
@@ -166,7 +174,9 @@ class Repository(private val db: AppDatabase) {
 
     suspend fun markCustomersSynced(ids: List<Long>) {
         if (ids.isNotEmpty()) {
-            db.customerDao().markCustomersSynced(ids)
+            ids.chunked(500).forEach { chunk ->
+                db.customerDao().markCustomersSynced(chunk)
+            }
         }
     }
 
