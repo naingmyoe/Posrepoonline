@@ -498,7 +498,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                                                         pendingDeletedSuppliers = getPendingDeletedSuppliers().toSet(),
                                                         pendingDeletedGroups = getPendingDeletedGroups().toSet(),
                                                         pendingDeletedUnits = getPendingDeletedUnits().toSet(),
-                                                        pendingDeletedPayments = getPendingDeletedPayments().toSet()
+                                                        pendingDeletedPayments = getPendingDeletedPayments().toSet(),
+                                                        authToken = getAuthToken(),
+                                                        deviceId = getStoredDeviceId(),
+                                                        pendingRestoreMirror = sharedPrefs.getBoolean("pending_db_restore_mirror", false)
                                                     )
                                                 }
                                             }
@@ -790,7 +793,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
         labelDue.value = com.example.util.AppLocalization.translate("အမ်းငွေ", lang)
     }
 
-    // Device ID and Internet helpers
+    // Device ID, Model, Auth Token, Password Hashing and Internet helpers
     fun getDeviceId(context: android.content.Context): String {
         val prefs = context.getSharedPreferences("pos_prefs", android.content.Context.MODE_PRIVATE)
         var devId = prefs.getString("device_id", null)
@@ -802,6 +805,66 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             prefs.edit().putString("device_id", devId).apply()
         }
         return devId
+    }
+
+    fun getPhoneModelName(): String {
+        val manufacturer = (Build.MANUFACTURER ?: "").trim()
+        val model = (Build.MODEL ?: "").trim()
+        if (model.isEmpty()) return manufacturer.ifEmpty { "Android Device" }
+        return if (manufacturer.isNotEmpty() && !model.lowercase().startsWith(manufacturer.lowercase())) {
+            val capBrand = manufacturer.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.US) else it.toString() }
+            "$capBrand $model"
+        } else {
+            model
+        }
+    }
+
+    private fun getStoredDeviceId(): String {
+        return try {
+            sharedPrefs.getString("device_id", null)?.takeIf { it.isNotBlank() } ?: getDeviceId(getApplication())
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    fun getAuthToken(phoneNo: String? = null): String {
+        val activePhone = _currentUser.value?.phoneNo ?: sharedPrefs.getString("logged_in_phone", "") ?: ""
+        val target = phoneNo?.takeIf { it.isNotBlank() } ?: activePhone
+        if (target.isNotBlank()) {
+            val token = sharedPrefs.getString("auth_token_$target", "") ?: ""
+            if (token.isNotBlank()) return token
+        }
+        return if (activePhone.isNotBlank()) {
+            sharedPrefs.getString("auth_token_$activePhone", "") ?: ""
+        } else {
+            ""
+        }
+    }
+
+    private fun saveAuthToken(phoneNo: String, token: String?) {
+        if (phoneNo.isNotBlank() && !token.isNullOrBlank()) {
+            sharedPrefs.edit().putString("auth_token_$phoneNo", token).apply()
+        }
+    }
+
+    private fun hashPasswordLocal(phone: String, password: String): String {
+        return try {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val input = "unpos_local_v1:${phone.trim()}:$password".toByteArray(Charsets.UTF_8)
+            val hash = digest.digest(input)
+            "sha256$" + hash.joinToString("") { "%02x".format(it) }
+        } catch (_: Exception) {
+            password
+        }
+    }
+
+    private fun verifyPasswordLocal(phone: String, inputPass: String, storedHash: String): Boolean {
+        if (storedHash.isBlank()) return false
+        return if (storedHash.startsWith("sha256$")) {
+            storedHash == hashPasswordLocal(phone, inputPass)
+        } else {
+            storedHash == inputPass
+        }
     }
 
     fun isInternetAvailable(context: android.content.Context): Boolean {
@@ -873,13 +936,15 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun checkUserActivationStatus(context: android.content.Context, phoneNo: String? = null): Pair<Boolean, String> {
         val targetPhone = phoneNo ?: sharedPrefs.getString("logged_in_phone", null) ?: currentUser.value?.phoneNo ?: registerPhone.value
         val deviceId = getDeviceId(context)
+        val phoneModel = getPhoneModelName()
         val capturedToken = sessionToken
 
         return withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/check-status"
                 val url = java.net.URL(apiUrl)
-                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
@@ -890,6 +955,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 val jsonInputString = org.json.JSONObject().apply {
                     if (!targetPhone.isNullOrEmpty()) put("phoneNo", targetPhone)
                     put("deviceId", deviceId)
+                    put("phoneModel", phoneModel)
                 }.toString()
 
                 conn.outputStream.use { os ->
@@ -1012,6 +1078,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 } else {
                     Pair(false, "အင်တာနက် ချိတ်ဆက်မှု အဆင်မပြေပါ")
                 }
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -1021,14 +1089,16 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
         isLoggingOutState = false
         sessionToken++
         val deviceId = getDeviceId(context)
+        val phoneModel = getPhoneModelName()
 
         return withContext(Dispatchers.IO) {
             val localAccCheck = repository.getAccountByPhone(phone)
+            var conn: java.net.HttpURLConnection? = null
 
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/login"
                 val url = java.net.URL(apiUrl)
-                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
@@ -1040,6 +1110,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     put("phoneNo", phone)
                     put("password", pass)
                     put("deviceId", deviceId)
+                    put("phoneModel", phoneModel)
                 }.toString()
 
                 conn.outputStream.use { os ->
@@ -1056,6 +1127,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 val message = json.optString("message", "")
                 val status = json.optString("status", "")
                 val userObj = json.optJSONObject("user")
+
+                if (responseCode == 429 || status == "rate_limited") {
+                    return@withContext Triple(false, if (message.isNotEmpty()) message else "Login ကြိုးစားမှု များလွန်းပါသဖြင့် ခေတ္တစောင့်ပါ", "rate_limited")
+                }
 
                 // 1. Explicit check for unregistered phone number
                 if (responseCode == 404 || status == "not_found" || message.contains("not registered", ignoreCase = true) || message.contains("not found", ignoreCase = true) || message.contains("register ပြုလုပ်ထားခြင်းမရှိပါ") || message.contains("မရှိပါ")) {
@@ -1088,7 +1163,12 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     return@withContext Triple(false, if (message.isNotEmpty()) message else "ဤအကောင့်ကို အများဆုံး စက် ၅ လုံးအထိသာ သုံးခွင့်ပြုထားပါသည် (Device limit of 5 reached)", "device_limit_reached")
                 }
 
+                val hashedPass = hashPasswordLocal(phone, pass)
+
                 if (success && status == "on") {
+                    val authToken = json.optString("authToken", "")
+                    saveAuthToken(phone, authToken)
+
                     val expiresAt = json.optLong("expiresAt", 0L)
                     val daysLeft = json.optInt("daysLeft", 7)
                     val isTrial = json.optBoolean("isTrial", true)
@@ -1116,7 +1196,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                             businessType = remoteBusinessType ?: localAccCheck?.businessType ?: "",
                             address = remoteAddress ?: localAccCheck?.address ?: "",
                             role = "CASHIER",
-                            passwordHash = pass,
+                            passwordHash = hashedPass,
                             deviceId = deviceId,
                             status = "pending",
                             joinCode = remoteJoinCode,
@@ -1136,7 +1216,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         businessType = remoteBusinessType ?: localAccCheck?.businessType ?: "",
                         address = remoteAddress ?: localAccCheck?.address ?: "",
                         role = remoteRole,
-                        passwordHash = pass,
+                        passwordHash = hashedPass,
                         deviceId = deviceId,
                         status = "on",
                         joinCode = remoteJoinCode,
@@ -1150,7 +1230,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     val remoteRole = userObj?.optString("role")?.takeIf { it.isNotEmpty() && it != "null" } ?: localAccCheck?.role ?: "ADMIN"
                     val remoteJoinCode = userObj?.optString("joinCode")?.takeIf { it.isNotEmpty() && it != "null" } ?: localAccCheck?.joinCode ?: ""
                     if (localAccCheck != null) {
-                        val pendingAcc = localAccCheck.copy(status = if (status.isNotBlank()) status else "pending", role = remoteRole, joinCode = remoteJoinCode)
+                        val pendingAcc = localAccCheck.copy(status = if (status.isNotBlank()) status else "pending", role = remoteRole, joinCode = remoteJoinCode, passwordHash = hashedPass)
                         repository.insertAccount(pendingAcc)
                         _currentUser.value = pendingAcc
                         cacheUserRoleAndAdmin(pendingAcc)
@@ -1166,33 +1246,40 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 // Offline fallback
                 val localAcc = repository.getAccountByPhone(phone)
                 if (localAcc != null) {
-                    if (localAcc.passwordHash != pass) {
+                    if (!verifyPasswordLocal(phone, pass, localAcc.passwordHash)) {
                         return@withContext Triple(false, "Password မှားယွင်းနေပါသည် (Incorrect password)", "invalid_password")
                     }
-                    if (localAcc.status == "expired") {
+                    val upgradedAcc = if (!localAcc.passwordHash.startsWith("sha256$")) {
+                        val u = localAcc.copy(passwordHash = hashPasswordLocal(phone, pass))
+                        repository.insertAccount(u)
+                        u
+                    } else localAcc
+                    if (upgradedAcc.status == "expired") {
                         return@withContext Triple(false, "အကောင့် သက်တမ်းကုန်ဆုံးသွားပါပြီ (Subscription Expired)", "expired")
                     }
-                    if (localAcc.status == "device_limit_reached") {
+                    if (upgradedAcc.status == "device_limit_reached") {
                         return@withContext Triple(false, "ဤအကောင့်ကို အများဆုံး စက် ၅ လုံးအထိသာ သုံးခွင့်ပြုထားပါသည် (Device limit of 5 reached)", "device_limit_reached")
                     }
-                    if (localAcc.status != "on" || (localAcc.role == "CASHIER" && localAcc.adminPhone.isBlank())) {
-                        _currentUser.value = localAcc
-                        cacheUserRoleAndAdmin(localAcc)
+                    if (upgradedAcc.status != "on" || (upgradedAcc.role == "CASHIER" && upgradedAcc.adminPhone.isBlank())) {
+                        _currentUser.value = upgradedAcc
+                        cacheUserRoleAndAdmin(upgradedAcc)
                         sharedPrefs.edit().putString("logged_in_phone", phone).putString("last_registered_phone", phone).apply()
                         return@withContext Triple(false, "Admin မှ အတည်ပြုပေးရန် စောင့်ဆိုင်းနေပါသည် (Pending Approval)", "pending")
                     }
-                    val isDeviceMatch = localAcc.deviceId.isNotBlank() && localAcc.deviceId == deviceId
+                    val isDeviceMatch = upgradedAcc.deviceId.isNotBlank() && upgradedAcc.deviceId == deviceId
                     if (!isDeviceMatch) {
                         sharedPrefs.edit().putString("logged_in_phone", phone).putString("last_registered_phone", phone).apply()
                         return@withContext Triple(false, "ဒီဖုန်းနံပါတ်သည် အခြား Device တွင် Register ပြုလုပ်ထားပါသည် (Device ID မတူညီပါ)", "device_mismatch")
                     }
-                    _currentUser.value = localAcc
-                    cacheUserRoleAndAdmin(localAcc)
+                    _currentUser.value = upgradedAcc
+                    cacheUserRoleAndAdmin(upgradedAcc)
                     sharedPrefs.edit().putString("logged_in_phone", phone).putString("last_registered_phone", phone).apply()
                     Triple(true, "Offline Login Successful", "on")
                 } else {
                     Triple(false, "ဤဖုန်းနံပါတ်ဖြင့် အကောင့်ဖွင့်ထားခြင်း မရှိပါ (Account not registered)", "not_found")
                 }
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -1220,6 +1307,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             _registrationStatus.value = "Registering..."
 
             val deviceId = getDeviceId(context)
+            val phoneModel = getPhoneModelName()
 
             val stages = listOf(0.00f, 0.05f, 0.22f, 0.50f, 0.74f, 0.95f, 1.00f)
             for (stage in stages) {
@@ -1245,15 +1333,18 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 clearProductForm()
             }
 
-            // Save user in local database with status (pending for cashier, off for admin initially)
+            val rawPhone = registerPhone.value.trim()
+            val rawPassword = registerPassword.value
+
+            // Save user in local database with locally hashed password and status (pending for cashier, off for admin initially)
             val newUser = UserAccount(
-                phoneNo = registerPhone.value.trim(),
+                phoneNo = rawPhone,
                 username = registerUsername.value.trim(),
                 businessName = registerBusinessName.value.trim(),
                 businessType = registerBusinessType.value.trim(),
                 address = registerAddress.value.trim(),
                 role = selectedRole.value,
-                passwordHash = registerPassword.value,
+                passwordHash = hashPasswordLocal(rawPhone, rawPassword),
                 deviceId = deviceId,
                 status = if (isCashier) "pending" else "off",
                 joinCode = generatedJoinCode,
@@ -1277,10 +1368,11 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
 
             // Asynchronously send data to Server Database
             withContext(Dispatchers.IO) {
+                var conn: java.net.HttpURLConnection? = null
                 try {
                     val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/register"
                     val url = java.net.URL(apiUrl)
-                    val conn = url.openConnection() as java.net.HttpURLConnection
+                    conn = url.openConnection() as java.net.HttpURLConnection
                     conn.requestMethod = "POST"
                     conn.setRequestProperty("Content-Type", "application/json; utf-8")
                     conn.setRequestProperty("Accept", "application/json")
@@ -1295,8 +1387,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         put("businessType", newUser.businessType)
                         put("address", newUser.address)
                         put("role", newUser.role)
-                        put("password", newUser.passwordHash)
+                        put("password", rawPassword)
                         put("deviceId", deviceId)
+                        put("phoneModel", phoneModel)
                         put("joinCode", generatedJoinCode)
                     }.toString()
 
@@ -1308,6 +1401,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     if (conn.responseCode in 200..299) {
                         val respStr = conn.inputStream.bufferedReader().use { it.readText() }
                         val json = org.json.JSONObject(respStr)
+                        val authToken = json.optString("authToken", "")
+                        saveAuthToken(newUser.phoneNo, authToken)
+
                         val st = if (isCashier) "pending" else json.optString("status", "on")
                         registrationFinalStatus = st
                         val expiresAt = json.optLong("expiresAt", System.currentTimeMillis() + 7 * 24 * 60 * 60 * 1000L)
@@ -1326,6 +1422,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } catch (e: Exception) {
                     e.printStackTrace()
+                } finally {
+                    try { conn?.disconnect() } catch (_: Exception) {}
                 }
             }
 
@@ -1345,6 +1443,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
         val adminBName = admin?.businessName ?: "UN Mobile POS"
         val adminBType = admin?.businessType ?: "Retail"
         val adminAddr = admin?.address ?: ""
+        val authToken = getAuthToken(adminPhone)
+        val deviceId = getStoredDeviceId()
 
         // 1. Try finding locally first
         val localCashier = repository.getAccountByJoinCode(cleanCode)
@@ -1360,12 +1460,15 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
 
             // Also notify server
             withContext(Dispatchers.IO) {
+                var conn: java.net.HttpURLConnection? = null
                 try {
                     val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/join-cashier"
                     val url = java.net.URL(apiUrl)
-                    val conn = url.openConnection() as java.net.HttpURLConnection
+                    conn = url.openConnection() as java.net.HttpURLConnection
                     conn.requestMethod = "POST"
                     conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                    if (authToken.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $authToken")
+                    if (deviceId.isNotBlank()) conn.setRequestProperty("X-Device-Id", deviceId)
                     conn.doOutput = true
                     conn.connectTimeout = 5000
                     val payload = org.json.JSONObject().apply {
@@ -1374,7 +1477,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     }.toString()
                     conn.outputStream.use { it.write(payload.toByteArray(charset("utf-8"))) }
                     conn.responseCode
-                } catch (_: Exception) {}
+                } catch (_: Exception) {
+                } finally {
+                    try { conn?.disconnect() } catch (_: Exception) {}
+                }
             }
             if (com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
                 triggerRealSync()
@@ -1384,12 +1490,15 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
 
         // 2. If not found locally, query cloud server
         return withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/join-cashier"
                 val url = java.net.URL(apiUrl)
-                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                if (authToken.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $authToken")
+                if (deviceId.isNotBlank()) conn.setRequestProperty("X-Device-Id", deviceId)
                 conn.doOutput = true
                 conn.connectTimeout = 6000
                 conn.readTimeout = 6000
@@ -1411,7 +1520,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                             businessType = cashierObj.optString("businessType", adminBType),
                             address = cashierObj.optString("address", adminAddr),
                             role = "CASHIER",
-                            passwordHash = cashierObj.optString("password", ""),
+                            passwordHash = "",
                             status = "on",
                             joinCode = cleanCode,
                             adminPhone = adminPhone
@@ -1429,6 +1538,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 }
             } catch (e: Exception) {
                 Pair(false, "ချိတ်ဆက်၍ မရပါ (ဤစက်တွင် မတွေ့ရှိပါ): ${e.localizedMessage ?: "အင်တာနက် မရှိပါ"}")
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -1437,12 +1548,17 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
         val admin = currentUser.value
         val adminPhone = admin?.phoneNo ?: sharedPrefs.getString("logged_in_phone", "") ?: ""
         if (adminPhone.isBlank() || admin?.role == "CASHIER") return
+        val authToken = getAuthToken(adminPhone)
+        val deviceId = getStoredDeviceId()
 
         withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/cashiers?phoneNo=" + java.net.URLEncoder.encode(adminPhone, "UTF-8")
-                val conn = java.net.URL(apiUrl).openConnection() as java.net.HttpURLConnection
+                conn = java.net.URL(apiUrl).openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "GET"
+                if (authToken.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $authToken")
+                if (deviceId.isNotBlank()) conn.setRequestProperty("X-Device-Id", deviceId)
                 conn.connectTimeout = 5000
                 conn.readTimeout = 5000
                 if (conn.responseCode in 200..299) {
@@ -1471,7 +1587,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         }
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
+            }
         }
     }
 
@@ -1480,14 +1599,19 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             return Pair(false, "Admin အကောင့်ကို ဖျက်၍မရပါ")
         }
         val adminPhone = currentUser.value?.phoneNo ?: sharedPrefs.getString("logged_in_phone", "") ?: ""
+        val authToken = getAuthToken(adminPhone)
+        val deviceId = getStoredDeviceId()
         repository.deleteAccount(account)
 
         withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/remove-cashier"
-                val conn = java.net.URL(apiUrl).openConnection() as java.net.HttpURLConnection
+                conn = java.net.URL(apiUrl).openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                if (authToken.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $authToken")
+                if (deviceId.isNotBlank()) conn.setRequestProperty("X-Device-Id", deviceId)
                 conn.doOutput = true
                 conn.connectTimeout = 5000
                 conn.readTimeout = 5000
@@ -1497,7 +1621,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 }.toString()
                 conn.outputStream.use { it.write(payload.toByteArray(charset("utf-8"))) }
                 conn.responseCode
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
+            }
         }
         return Pair(true, "Cashier '${account.username}' (${account.phoneNo}) အကောင့်ကို ဖျက်ပြီးပါပြီ")
     }
@@ -1510,17 +1637,23 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             return "on"
         }
 
+        val deviceId = getStoredDeviceId()
+        val phoneModel = getPhoneModelName()
+
         return withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/check-status"
                 val url = java.net.URL(apiUrl)
-                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.doOutput = true
                 conn.connectTimeout = 5000
                 val payload = org.json.JSONObject().apply {
                     put("phoneNo", phone)
+                    if (deviceId.isNotBlank()) put("deviceId", deviceId)
+                    put("phoneModel", phoneModel)
                 }.toString()
                 conn.outputStream.use { it.write(payload.toByteArray(charset("utf-8"))) }
                 if (conn.responseCode in 200..299) {
@@ -1549,74 +1682,34 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         cacheUserRoleAndAdmin(updated)
                         "on"
                     } else {
-                        if (st == "not_found" && local != null) {
-                            // Re-register pending cashier on server if missing
-                            try {
-                                val regUrl = java.net.URL(cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/register")
-                                val rConn = regUrl.openConnection() as java.net.HttpURLConnection
-                                rConn.requestMethod = "POST"
-                                rConn.setRequestProperty("Content-Type", "application/json; utf-8")
-                                rConn.doOutput = true
-                                rConn.connectTimeout = 5000
-                                val rPayload = org.json.JSONObject().apply {
-                                    put("phoneNo", local.phoneNo)
-                                    put("username", local.username)
-                                    put("businessName", local.businessName)
-                                    put("businessType", local.businessType)
-                                    put("address", local.address)
-                                    put("role", "CASHIER")
-                                    put("password", local.passwordHash)
-                                    put("deviceId", local.deviceId)
-                                    put("joinCode", local.joinCode)
-                                }.toString()
-                                rConn.outputStream.use { it.write(rPayload.toByteArray(charset("utf-8"))) }
-                                rConn.responseCode
-                            } catch (_: Exception) {}
-                        }
                         "pending"
                     }
                 } else {
-                    if (conn.responseCode == 404 && local != null) {
-                        try {
-                            val regUrl = java.net.URL(cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/register")
-                            val rConn = regUrl.openConnection() as java.net.HttpURLConnection
-                            rConn.requestMethod = "POST"
-                            rConn.setRequestProperty("Content-Type", "application/json; utf-8")
-                            rConn.doOutput = true
-                            rConn.connectTimeout = 5000
-                            val rPayload = org.json.JSONObject().apply {
-                                put("phoneNo", local.phoneNo)
-                                put("username", local.username)
-                                put("businessName", local.businessName)
-                                put("businessType", local.businessType)
-                                put("address", local.address)
-                                put("role", "CASHIER")
-                                put("password", local.passwordHash)
-                                put("deviceId", local.deviceId)
-                                put("joinCode", local.joinCode)
-                            }.toString()
-                            rConn.outputStream.use { it.write(rPayload.toByteArray(charset("utf-8"))) }
-                            rConn.responseCode
-                        } catch (_: Exception) {}
-                    }
                     "pending"
                 }
             } catch (_: Exception) {
                 if (local?.status == "on" && local.adminPhone.isNotBlank()) "on" else "pending"
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
 
     // Change Password Method
     suspend fun changePassword(phone: String, oldPass: String, newPass: String): Pair<Boolean, String> {
+        val authToken = getAuthToken(phone)
+        val deviceId = getStoredDeviceId()
         return withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/change-password"
                 val url = java.net.URL(apiUrl)
-                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
+                if (authToken.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $authToken")
+                if (deviceId.isNotBlank()) conn.setRequestProperty("X-Device-Id", deviceId)
                 conn.doOutput = true
                 conn.connectTimeout = 6000
                 conn.readTimeout = 6000
@@ -1643,7 +1736,7 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 if (success) {
                     val localAcc = repository.getAccountByPhone(phone)
                     if (localAcc != null) {
-                        val updated = localAcc.copy(passwordHash = newPass)
+                        val updated = localAcc.copy(passwordHash = hashPasswordLocal(phone, newPass))
                         repository.insertAccount(updated)
                         if (_currentUser.value?.phoneNo == phone) {
                             _currentUser.value = updated
@@ -1654,18 +1747,20 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 e.printStackTrace()
                 val localAcc = repository.getAccountByPhone(phone)
-                if (localAcc != null && localAcc.passwordHash == oldPass) {
-                    val updated = localAcc.copy(passwordHash = newPass)
+                if (localAcc != null && verifyPasswordLocal(phone, oldPass, localAcc.passwordHash)) {
+                    val updated = localAcc.copy(passwordHash = hashPasswordLocal(phone, newPass))
                     repository.insertAccount(updated)
                     if (_currentUser.value?.phoneNo == phone) {
                         _currentUser.value = updated
                     }
                     Pair(true, "Password changed locally")
-                } else if (localAcc != null && localAcc.passwordHash != oldPass) {
+                } else if (localAcc != null && !verifyPasswordLocal(phone, oldPass, localAcc.passwordHash)) {
                     Pair(false, "ယခင်စကားဝှက် မှားယွင်းနေပါသည်")
                 } else {
                     Pair(false, "အင်တာနက် ချိတ်ဆက်မှု အဆင်မပြေပါ")
                 }
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -1673,14 +1768,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
     suspend fun updatePasswordDirectly(phone: String, newPass: String): Pair<Boolean, String> {
         return withContext(Dispatchers.IO) {
             val localAcc = repository.getAccountByPhone(phone)
-            val oldPass = localAcc?.passwordHash ?: ""
-            if (oldPass.isNotEmpty()) {
-                val res = changePassword(phone, oldPass, newPass)
-                if (res.first) return@withContext res
-            }
             try {
                 if (localAcc != null) {
-                    val updated = localAcc.copy(passwordHash = newPass)
+                    val updated = localAcc.copy(passwordHash = hashPasswordLocal(phone, newPass))
                     repository.insertAccount(updated)
                     if (_currentUser.value?.phoneNo == phone) {
                         _currentUser.value = updated
@@ -1698,14 +1788,19 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
 
     // Delete User Account Method
     suspend fun deleteUserAccount(phone: String, pass: String): Pair<Boolean, String> {
+        val authToken = getAuthToken(phone)
+        val deviceId = getStoredDeviceId()
         return withContext(Dispatchers.IO) {
+            var conn: java.net.HttpURLConnection? = null
             try {
                 val apiUrl = cloudflareWorkerUrl.value.trim().removeSuffix("/") + "/api/delete-user"
                 val url = java.net.URL(apiUrl)
-                val conn = url.openConnection() as java.net.HttpURLConnection
+                conn = url.openConnection() as java.net.HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
+                if (authToken.isNotBlank()) conn.setRequestProperty("Authorization", "Bearer $authToken")
+                if (deviceId.isNotBlank()) conn.setRequestProperty("X-Device-Id", deviceId)
                 conn.doOutput = true
                 conn.connectTimeout = 6000
                 conn.readTimeout = 6000
@@ -1732,28 +1827,30 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     val localAcc = repository.getAccountByPhone(phone)
                     if (localAcc != null) {
                         repository.deleteAccount(localAcc)
-                        if (_currentUser.value?.phoneNo == phone) {
-                            _currentUser.value = null
-                            sharedPrefs.edit().remove("logged_in_phone").apply()
-                        }
+                    }
+                    if (_currentUser.value?.phoneNo == phone) {
+                        _currentUser.value = null
+                        sharedPrefs.edit().remove("logged_in_phone").remove("auth_token_$phone").apply()
                     }
                 }
                 Pair(success, message)
             } catch (e: Exception) {
                 e.printStackTrace()
                 val localAcc = repository.getAccountByPhone(phone)
-                if (localAcc != null && localAcc.passwordHash == pass) {
+                if (localAcc != null && verifyPasswordLocal(phone, pass, localAcc.passwordHash)) {
                     repository.deleteAccount(localAcc)
                     if (_currentUser.value?.phoneNo == phone) {
                         _currentUser.value = null
-                        sharedPrefs.edit().remove("logged_in_phone").apply()
+                        sharedPrefs.edit().remove("logged_in_phone").remove("auth_token_$phone").apply()
                     }
                     Pair(true, "Account deleted locally")
-                } else if (localAcc != null && localAcc.passwordHash != pass) {
+                } else if (localAcc != null && !verifyPasswordLocal(phone, pass, localAcc.passwordHash)) {
                     Pair(false, "စကားဝှက် မှားယွင်းနေပါသည်")
                 } else {
                     Pair(false, "အင်တာနက် ချိတ်ဆက်မှု အဆင်မပြေပါ")
                 }
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -1835,7 +1932,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                                     productId = editedToAdjust.id,
                                     productName = editedToAdjust.name,
                                     newQuantity = editedToAdjust.quantity,
-                                    newAlertQuantity = editedToAdjust.alertQuantity
+                                    newAlertQuantity = editedToAdjust.alertQuantity,
+                                    authToken = getAuthToken(),
+                                    deviceId = getStoredDeviceId()
                                 )
                             }
                         }
@@ -2100,7 +2199,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         workerUrl = cloudflareWorkerUrl.value,
                         userPhone = phone,
                         productId = product.id,
-                        productName = product.name
+                        productName = product.name,
+                        authToken = getAuthToken(),
+                        deviceId = getStoredDeviceId()
                     )
                     if (ok) {
                         removePendingDeletedProduct(product.id, product.name)
@@ -2168,8 +2269,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 recordPendingDeletedGroup(oldGroup.name)
                 val phone = getCloudPhone()
                 if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                    val token = getAuthToken()
+                    val devId = getStoredDeviceId()
                     viewModelScope.launch(Dispatchers.IO) {
-                        com.example.util.SyncManager.deleteGroupOnCloud(cloudflareWorkerUrl.value, phone, oldGroup.name)
+                        com.example.util.SyncManager.deleteGroupOnCloud(cloudflareWorkerUrl.value, phone, oldGroup.name, token, devId)
                     }
                     triggerRealSync()
                 }
@@ -2184,8 +2287,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             recordPendingDeletedGroup(group.name)
             val phone = getCloudPhone()
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                val token = getAuthToken()
+                val devId = getStoredDeviceId()
                 viewModelScope.launch(Dispatchers.IO) {
-                    com.example.util.SyncManager.deleteGroupOnCloud(cloudflareWorkerUrl.value, phone, group.name)
+                    com.example.util.SyncManager.deleteGroupOnCloud(cloudflareWorkerUrl.value, phone, group.name, token, devId)
                 }
                 triggerRealSync()
             }
@@ -2220,8 +2325,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 recordPendingDeletedUnit(oldUnit.name)
                 val phone = getCloudPhone()
                 if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                    val token = getAuthToken()
+                    val devId = getStoredDeviceId()
                     viewModelScope.launch(Dispatchers.IO) {
-                        com.example.util.SyncManager.deleteUnitOnCloud(cloudflareWorkerUrl.value, phone, oldUnit.name)
+                        com.example.util.SyncManager.deleteUnitOnCloud(cloudflareWorkerUrl.value, phone, oldUnit.name, token, devId)
                     }
                     triggerRealSync()
                 }
@@ -2236,8 +2343,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             recordPendingDeletedUnit(unit.name)
             val phone = getCloudPhone()
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                val token = getAuthToken()
+                val devId = getStoredDeviceId()
                 viewModelScope.launch(Dispatchers.IO) {
-                    com.example.util.SyncManager.deleteUnitOnCloud(cloudflareWorkerUrl.value, phone, unit.name)
+                    com.example.util.SyncManager.deleteUnitOnCloud(cloudflareWorkerUrl.value, phone, unit.name, token, devId)
                 }
                 triggerRealSync()
             }
@@ -2269,8 +2378,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 recordPendingDeletedCustomer(oldName.trim(), customer.id)
                 val phone = getCloudPhone()
                 if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                    val token = getAuthToken()
+                    val devId = getStoredDeviceId()
                     viewModelScope.launch(Dispatchers.IO) {
-                        com.example.util.SyncManager.deleteCustomerOnCloud(cloudflareWorkerUrl.value, phone, oldName.trim(), customer.id)
+                        com.example.util.SyncManager.deleteCustomerOnCloud(cloudflareWorkerUrl.value, phone, oldName.trim(), customer.id, token, devId)
                     }
                 }
             }
@@ -2288,8 +2399,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             recordPendingDeletedCustomer(customer.name, customer.id)
             val phone = getCloudPhone()
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                val token = getAuthToken()
+                val devId = getStoredDeviceId()
                 viewModelScope.launch(Dispatchers.IO) {
-                    com.example.util.SyncManager.deleteCustomerOnCloud(cloudflareWorkerUrl.value, phone, customer.name, customer.id)
+                    com.example.util.SyncManager.deleteCustomerOnCloud(cloudflareWorkerUrl.value, phone, customer.name, customer.id, token, devId)
                 }
                 triggerRealSync()
             }
@@ -2323,8 +2436,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 recordPendingDeletedSupplier(oldName.trim(), supplier.id)
                 val phone = getCloudPhone()
                 if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                    val token = getAuthToken()
+                    val devId = getStoredDeviceId()
                     viewModelScope.launch(Dispatchers.IO) {
-                        com.example.util.SyncManager.deleteSupplierOnCloud(cloudflareWorkerUrl.value, phone, oldName.trim(), supplier.id)
+                        com.example.util.SyncManager.deleteSupplierOnCloud(cloudflareWorkerUrl.value, phone, oldName.trim(), supplier.id, token, devId)
                     }
                 }
             }
@@ -2344,8 +2459,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             recordPendingDeletedSupplier(supplier.name, supplier.id)
             val phone = getCloudPhone()
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                val token = getAuthToken()
+                val devId = getStoredDeviceId()
                 viewModelScope.launch(Dispatchers.IO) {
-                    com.example.util.SyncManager.deleteSupplierOnCloud(cloudflareWorkerUrl.value, phone, supplier.name, supplier.id)
+                    com.example.util.SyncManager.deleteSupplierOnCloud(cloudflareWorkerUrl.value, phone, supplier.name, supplier.id, token, devId)
                 }
                 triggerRealSync()
             }
@@ -2375,8 +2492,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 recordPendingDeletedPayment(oldMethod)
                 val phone = getCloudPhone()
                 if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                    val token = getAuthToken()
+                    val devId = getStoredDeviceId()
                     viewModelScope.launch(Dispatchers.IO) {
-                        com.example.util.SyncManager.deletePaymentOnCloud(cloudflareWorkerUrl.value, phone, oldMethod)
+                        com.example.util.SyncManager.deletePaymentOnCloud(cloudflareWorkerUrl.value, phone, oldMethod, token, devId)
                     }
                     triggerRealSync()
                 }
@@ -2391,8 +2510,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             recordPendingDeletedPayment(payment.method)
             val phone = getCloudPhone()
             if (phone.isNotBlank() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                val token = getAuthToken()
+                val devId = getStoredDeviceId()
                 viewModelScope.launch(Dispatchers.IO) {
-                    com.example.util.SyncManager.deletePaymentOnCloud(cloudflareWorkerUrl.value, phone, payment.method)
+                    com.example.util.SyncManager.deletePaymentOnCloud(cloudflareWorkerUrl.value, phone, payment.method, token, devId)
                 }
                 triggerRealSync()
             }
@@ -2640,7 +2761,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                             workerUrl = cloudflareWorkerUrl.value,
                             userPhone = phone,
                             voucher = voucher,
-                            items = currentVoucherItems
+                            items = currentVoucherItems,
+                            authToken = getAuthToken(),
+                            deviceId = getStoredDeviceId()
                         )
                         if (synced) {
                             repository.markVoucherSynced(voucherId)
@@ -2682,11 +2805,15 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
 
             val phone = getCloudPhone()
             if (phone.isNotEmpty() && com.example.util.SyncManager.isNetworkAvailable(getApplication())) {
+                val token = getAuthToken()
+                val devId = getStoredDeviceId()
                 viewModelScope.launch(Dispatchers.IO) {
                     val ok = com.example.util.SyncManager.deleteVoucherOnCloud(
                         workerUrl = cloudflareWorkerUrl.value,
                         userPhone = phone,
-                        receiptNo = voucherId
+                        receiptNo = voucherId,
+                        authToken = token,
+                        deviceId = devId
                     )
                     if (ok) {
                         removePendingDeletedVoucher(voucherId)
@@ -2720,7 +2847,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         productId = productId,
                         productName = prod?.name ?: "",
                         newQuantity = newQuantity,
-                        newAlertQuantity = prod?.alertQuantity ?: 0
+                        newAlertQuantity = prod?.alertQuantity ?: 0,
+                        authToken = getAuthToken(),
+                        deviceId = getStoredDeviceId()
                     )
                 }
                 if (ok) {
@@ -2747,7 +2876,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         productId = productId,
                         productName = prod?.name ?: "",
                         newQuantity = newQuantity,
-                        newAlertQuantity = newAlertQuantity
+                        newAlertQuantity = newAlertQuantity,
+                        authToken = getAuthToken(),
+                        deviceId = getStoredDeviceId()
                     )
                 }
                 if (ok) {
@@ -2812,7 +2943,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                             productId = productId,
                             productName = prod.name,
                             newQuantity = afterQty,
-                            newAlertQuantity = prod.alertQuantity
+                            newAlertQuantity = prod.alertQuantity,
+                            authToken = getAuthToken(),
+                            deviceId = getStoredDeviceId()
                         )
                     }
                     if (ok) {
@@ -2961,7 +3094,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 val result = com.example.util.SyncManager.mirrorLocalToCloud(
                     workerUrl = cloudflareWorkerUrl.value,
                     userPhone = phone,
-                    repository = repository
+                    repository = repository,
+                    authToken = getAuthToken(),
+                    deviceId = getStoredDeviceId()
                 )
                 clearPendingDeletedProducts()
                 _isUploading.value = false
@@ -2993,7 +3128,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
             val result = com.example.util.SyncManager.mirrorLocalToCloud(
                 workerUrl = cloudflareWorkerUrl.value,
                 userPhone = phone,
-                repository = repository
+                repository = repository,
+                authToken = getAuthToken(),
+                deviceId = getStoredDeviceId()
             )
             if (result.success) {
                 sharedPrefs.edit().putBoolean("pending_db_restore_mirror", false).commit()
@@ -3055,7 +3192,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     pendingDeletedSuppliers = delSuppliers,
                     pendingDeletedGroups = delGroups,
                     pendingDeletedUnits = delUnits,
-                    pendingDeletedPayments = delPayments
+                    pendingDeletedPayments = delPayments,
+                    authToken = getAuthToken(),
+                    deviceId = getStoredDeviceId()
                 )
                 if (result.success) {
                     if (delIds.isNotEmpty() || delNames.isNotEmpty()) {
@@ -3133,7 +3272,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         cloudDownloadProgress.value = progress
                         cloudDownloadProgressMsg.value = msg
                         syncStatusMessage.value = msg
-                    }
+                    },
+                    authToken = getAuthToken(),
+                    deviceId = getStoredDeviceId(),
+                    pendingRestoreMirror = sharedPrefs.getBoolean("pending_db_restore_mirror", false)
                 )
                 _isUploading.value = false
                 syncStatusMessage.value = result.message
@@ -3171,7 +3313,10 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 onProgress = { progress, msg ->
                     cloudDownloadProgress.value = progress
                     cloudDownloadProgressMsg.value = msg
-                }
+                },
+                authToken = getAuthToken(),
+                deviceId = getStoredDeviceId(),
+                pendingRestoreMirror = sharedPrefs.getBoolean("pending_db_restore_mirror", false)
             )
             if (result.success) {
                 val now = System.currentTimeMillis()
@@ -3217,7 +3362,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                 key.startsWith("cashier_join_code_") ||
                 key.startsWith("account_expires_at_") ||
                 key.startsWith("account_days_left_") ||
-                key.startsWith("account_is_trial_")
+                key.startsWith("account_is_trial_") ||
+                key.startsWith("auth_token_")
             ) {
                 editor.remove(key)
             }
@@ -3333,6 +3479,8 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                     val delPayments = getPendingDeletedPayments()
 
                     onProgress(0.40f, "အော့ဖ်လိုင်း စာရင်းများကို Cloud သို့ ပို့ဆောင်နေပါသည်...")
+                    val currentToken = getAuthToken()
+                    val currentDevId = getStoredDeviceId()
                     val syncResult = com.example.util.SyncManager.syncAllPendingData(
                         workerUrl = cloudflareWorkerUrl.value,
                         userPhone = phone,
@@ -3345,7 +3493,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         pendingDeletedSuppliers = delSuppliers,
                         pendingDeletedGroups = delGroups,
                         pendingDeletedUnits = delUnits,
-                        pendingDeletedPayments = delPayments
+                        pendingDeletedPayments = delPayments,
+                        authToken = currentToken,
+                        deviceId = currentDevId
                     )
 
                     onProgress(0.70f, "Local အတိုင်း Cloud သို့ ၁၀၀% Mirror သိမ်းဆည်းနေပါသည်...")
@@ -3356,7 +3506,9 @@ class POSViewModel(application: Application) : AndroidViewModel(application) {
                         onProgress = { p, msg ->
                             val combined = 0.70f + (p * 0.25f)
                             onProgress(combined, msg)
-                        }
+                        },
+                        authToken = currentToken,
+                        deviceId = currentDevId
                     )
 
                     onProgress(0.95f, "အကောင့် ဒေတာများ လုံခြုံစွာ ရှင်းလင်းနေပါသည်...")

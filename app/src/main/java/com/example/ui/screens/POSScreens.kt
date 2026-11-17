@@ -189,6 +189,16 @@ fun SplashScreen(navController: NavController, viewModel: POSViewModel) {
                 return@launch
             }
 
+            // Require one-time sign-in when upgrading from an older APK without a Bearer session token
+            val authToken = sharedPrefs.getString("auth_token_$loggedPhone", "")
+            if (authToken.isNullOrBlank()) {
+                kotlinx.coroutines.delay(400)
+                navController.navigate("login") {
+                    popUpTo("splash") { inclusive = true }
+                }
+                return@launch
+            }
+
             // Check if account has already expired (by timestamp or status)
             if (viewModel.checkAndSetAccountExpiredDirect(loggedPhone)) {
                 navController.navigate("subscription_expired") {
@@ -13555,7 +13565,7 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
                         null,
                         android.database.sqlite.SQLiteDatabase.OPEN_READWRITE
                     )
-                    val cursor = sqliteDb.rawQuery("SELECT phoneNo FROM user_accounts ORDER BY id DESC LIMIT 1", null)
+                    val cursor = sqliteDb.rawQuery("SELECT phoneNo FROM user_accounts LIMIT 1", null)
                     if (cursor.moveToFirst()) {
                         val candidate = cursor.getString(0)
                         if (!candidate.isNullOrEmpty()) {
@@ -13563,6 +13573,9 @@ fun SettingsScreen(navController: NavController, viewModel: POSViewModel) {
                         }
                     }
                     cursor.close()
+                    try { sqliteDb.execSQL("UPDATE products SET isSynced = 0") } catch (_: Exception) {}
+                    try { sqliteDb.execSQL("UPDATE vouchers SET isSynced = 0") } catch (_: Exception) {}
+                    try { sqliteDb.execSQL("UPDATE customers SET isSynced = 0") } catch (_: Exception) {}
                     sqliteDb.close()
                 } catch (_: Exception) {}
 

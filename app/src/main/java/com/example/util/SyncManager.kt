@@ -11,13 +11,30 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.BufferedWriter
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
+import java.io.Writer
 import java.net.HttpURLConnection
 import java.net.URL
 
 object SyncManager {
     private const val TAG = "POSSyncManager"
+
+    private fun HttpURLConnection.applyAuthHeaders(authToken: String, deviceId: String) {
+        if (authToken.isNotBlank()) {
+            setRequestProperty("Authorization", "Bearer $authToken")
+        }
+        if (deviceId.isNotBlank()) {
+            setRequestProperty("X-Device-Id", deviceId)
+        }
+    }
+
+    private fun safeDouble(value: Double): Double = if (value.isFinite()) value else 0.0
+
+    private fun Writer.writeJsonStr(value: String?) {
+        write(JSONObject.quote(value ?: ""))
+    }
 
     data class SyncResult(
         val success: Boolean,
@@ -74,9 +91,10 @@ object SyncManager {
             }
 
             val start = System.currentTimeMillis()
+            var conn: HttpURLConnection? = null
             try {
                 val checkUrl = URL("$cleanUrl/api/check-status")
-                val conn = checkUrl.openConnection() as HttpURLConnection
+                conn = checkUrl.openConnection() as HttpURLConnection
                 conn.requestMethod = "GET"
                 conn.connectTimeout = 4000
                 conn.readTimeout = 4000
@@ -99,6 +117,8 @@ object SyncManager {
                 ServerCheckResult(false, 0, "Server Domain/IP ကို ရှာမတွေ့ပါ (Unknown Host)။")
             } catch (e: Exception) {
                 ServerCheckResult(false, 0, "Server ချိတ်ဆက်၍မရပါ: ${e.message}")
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -111,20 +131,24 @@ object SyncManager {
         workerUrl: String,
         userPhone: String,
         voucher: Voucher,
-        items: List<VoucherItem>
+        items: List<VoucherItem>,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean {
         if (userPhone.isBlank()) return false
 
         return withContext(Dispatchers.IO) {
+            var conn: HttpURLConnection? = null
             try {
                 val targetUrl = workerUrl.trim().removeSuffix("/") + "/api/sync/voucher"
                 val url = URL(targetUrl)
-                val conn = url.openConnection() as HttpURLConnection
+                conn = url.openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.connectTimeout = 6000
                 conn.readTimeout = 6000
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
+                conn.applyAuthHeaders(authToken, deviceId)
                 conn.doOutput = true
 
                 val voucherJson = JSONObject().apply {
@@ -173,6 +197,8 @@ object SyncManager {
             } catch (e: Exception) {
                 Log.e(TAG, "Single voucher sync failed: ${e.message}")
                 false
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
@@ -181,17 +207,21 @@ object SyncManager {
         workerUrl: String,
         userPhone: String,
         productId: Long,
-        productName: String
+        productName: String,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
         val cleanUrl = workerUrl.trim().removeSuffix("/")
+        var conn: HttpURLConnection? = null
         try {
             val targetUrl = "$cleanUrl/api/sync/delete-product"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -205,6 +235,8 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -212,17 +244,21 @@ object SyncManager {
         workerUrl: String,
         userPhone: String,
         productIds: List<Long>,
-        productNames: List<String>
+        productNames: List<String>,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank() || (productIds.isEmpty() && productNames.isEmpty())) return@withContext false
         val cleanUrl = workerUrl.trim().removeSuffix("/")
+        var conn: HttpURLConnection? = null
         try {
             val targetUrl = "$cleanUrl/api/sync/delete-products"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val idsArr = JSONArray()
@@ -241,23 +277,29 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
     suspend fun deleteVoucherOnCloud(
         workerUrl: String,
         userPhone: String,
-        receiptNo: String
+        receiptNo: String,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank() || receiptNo.isBlank()) return@withContext false
         val cleanUrl = workerUrl.trim().removeSuffix("/")
+        var conn: HttpURLConnection? = null
         try {
             val targetUrl = "$cleanUrl/api/sync/delete-voucher"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -270,6 +312,8 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -279,17 +323,21 @@ object SyncManager {
         productId: Long,
         productName: String,
         newQuantity: Int,
-        newAlertQuantity: Int
+        newAlertQuantity: Int,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
         val cleanUrl = workerUrl.trim().removeSuffix("/")
+        var conn: HttpURLConnection? = null
         try {
             val targetUrl = "$cleanUrl/api/sync/adjust-stock"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -305,6 +353,8 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -312,17 +362,21 @@ object SyncManager {
         workerUrl: String,
         userPhone: String,
         customerName: String,
-        customerId: Long = 0L
+        customerId: Long = 0L,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
+        var conn: HttpURLConnection? = null
         try {
             val cleanUrl = workerUrl.trim().removeSuffix("/")
             val targetUrl = "$cleanUrl/api/sync/delete-customer"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -335,6 +389,8 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -342,17 +398,21 @@ object SyncManager {
         workerUrl: String,
         userPhone: String,
         supplierName: String,
-        supplierId: Long = 0L
+        supplierId: Long = 0L,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
+        var conn: HttpURLConnection? = null
         try {
             val cleanUrl = workerUrl.trim().removeSuffix("/")
             val targetUrl = "$cleanUrl/api/sync/delete-supplier"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -365,23 +425,29 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
     suspend fun deleteGroupOnCloud(
         workerUrl: String,
         userPhone: String,
-        groupName: String
+        groupName: String,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
+        var conn: HttpURLConnection? = null
         try {
             val cleanUrl = workerUrl.trim().removeSuffix("/")
             val targetUrl = "$cleanUrl/api/sync/delete-group"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -393,23 +459,29 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
     suspend fun deleteUnitOnCloud(
         workerUrl: String,
         userPhone: String,
-        unitName: String
+        unitName: String,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
+        var conn: HttpURLConnection? = null
         try {
             val cleanUrl = workerUrl.trim().removeSuffix("/")
             val targetUrl = "$cleanUrl/api/sync/delete-unit"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -421,23 +493,29 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
     suspend fun deletePaymentOnCloud(
         workerUrl: String,
         userPhone: String,
-        method: String
+        method: String,
+        authToken: String = "",
+        deviceId: String = ""
     ): Boolean = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) return@withContext false
+        var conn: HttpURLConnection? = null
         try {
             val cleanUrl = workerUrl.trim().removeSuffix("/")
             val targetUrl = "$cleanUrl/api/sync/delete-payment"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 8000
             conn.readTimeout = 8000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
 
             val payload = JSONObject().apply {
@@ -449,6 +527,8 @@ object SyncManager {
         } catch (e: Exception) {
             e.printStackTrace()
             false
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -460,7 +540,9 @@ object SyncManager {
         workerUrl: String,
         userPhone: String,
         repository: Repository,
-        onProgress: (Float, String) -> Unit = { _, _ -> }
+        onProgress: (Float, String) -> Unit = { _, _ -> },
+        authToken: String = "",
+        deviceId: String = ""
     ): SyncResult = withContext(Dispatchers.IO) {
         if (workerUrl.isBlank() || userPhone.isBlank()) {
             return@withContext SyncResult(false, 0, 0, 0, "ကျေးဇူးပြု၍ Login ဝင်ထားပါ (No user phone)")
@@ -472,6 +554,7 @@ object SyncManager {
             return@withContext SyncResult(false, 0, 0, 0, check.message)
         }
 
+        var conn: HttpURLConnection? = null
         try {
             onProgress(0.3f, "ဒေတာများကို စုစည်းပြင်ဆင်နေပါသည်...")
             val allProducts = repository.getAllProductsDirect()
@@ -486,166 +569,184 @@ object SyncManager {
             val allExpenses = repository.getAllExpensesDirect()
             val allStockAdjustments = repository.getAllStockAdjustmentsDirect()
 
-            val prodsArr = JSONArray()
-            for (p in allProducts) {
-                prodsArr.put(JSONObject().apply {
-                    put("id", p.id)
-                    put("name", p.name)
-                    put("groupName", p.groupName)
-                    put("purchasePrice", p.purchasePrice)
-                    put("sellingPrice", p.sellingPrice)
-                    put("unit", p.unit)
-                    put("barcode", p.barcode)
-                    put("quantity", p.quantity)
-                    put("alertQuantity", p.alertQuantity)
-                    put("trackStock", p.trackStock)
-                    put("note", p.note)
-                })
-            }
-
-            val vouchersArr = JSONArray()
-            for (v in allVouchers) {
-                vouchersArr.put(JSONObject().apply {
-                    put("receiptNo", v.receiptNo)
-                    put("timestamp", v.timestamp)
-                    put("cashierName", v.cashierName)
-                    put("totalAmount", v.totalAmount)
-                    put("totalItems", v.totalItems)
-                    put("customerName", v.customerName)
-                    put("paymentMethod", v.paymentMethod)
-                    put("isCompleted", v.isCompleted)
-                    put("isPurchase", v.isPurchase)
-                    put("paidAmount", v.paidAmount)
-                    put("changeAmount", v.changeAmount)
-                    put("balanceAmount", v.balanceAmount)
-                    put("note", v.note)
-                    put("discount", v.discount)
-                    put("fee", v.fee)
-                })
-            }
-
-            val vItemsArr = JSONArray()
-            for (it in allVoucherItems) {
-                vItemsArr.put(JSONObject().apply {
-                    put("voucherId", it.voucherId)
-                    put("productId", it.productId)
-                    put("productName", it.productName)
-                    put("quantity", it.quantity)
-                    put("purchasePrice", it.purchasePrice)
-                    put("sellingPrice", it.sellingPrice)
-                })
-            }
-
-            val custsArr = JSONArray()
-            val seenCustNames = mutableSetOf<String>()
-            for (c in allCustomers) {
-                val clean = c.name.trim()
-                val norm = clean.lowercase()
-                if (clean.isNotBlank() && norm !in seenCustNames) {
-                    seenCustNames.add(norm)
-                    custsArr.put(JSONObject().apply {
-                        put("name", clean)
-                        put("phone", c.phone)
-                        put("address", c.address)
-                        put("note", c.note)
-                    })
-                }
-            }
-
-            val groupsArr = JSONArray()
-            allGroups.forEach { groupsArr.put(it) }
-
-            val unitsArr = JSONArray()
-            allUnits.forEach { unitsArr.put(it) }
-
-            val paymentsArr = JSONArray()
-            for (p in allPayments) {
-                paymentsArr.put(JSONObject().apply {
-                    put("method", p.method)
-                    put("amount", p.amount)
-                    put("date", p.date)
-                })
-            }
-
-            val suppliersArr = JSONArray()
-            val seenSupNames = mutableSetOf<String>()
-            for (s in allSuppliers) {
-                val clean = s.name.trim()
-                val norm = clean.lowercase()
-                if (clean.isNotBlank() && norm !in seenSupNames) {
-                    seenSupNames.add(norm)
-                    suppliersArr.put(JSONObject().apply {
-                        put("name", clean)
-                        put("phone", s.phone)
-                        put("address", s.address)
-                        put("note", s.note)
-                    })
-                }
-            }
-
-            val expenseCatsArr = JSONArray()
-            for (ec in allExpenseCategories) {
-                expenseCatsArr.put(JSONObject().apply {
-                    put("name", ec.name)
-                    put("iconName", ec.iconName)
-                })
-            }
-
-            val expensesArr = JSONArray()
-            for (e in allExpenses) {
-                expensesArr.put(JSONObject().apply {
-                    put("categoryName", e.categoryName)
-                    put("description", e.description)
-                    put("amount", e.amount)
-                    put("paymentMethod", e.paymentMethod)
-                    put("note", e.note)
-                    put("timestamp", e.timestamp)
-                    put("dateString", e.dateString)
-                    put("timeString", e.timeString)
-                })
-            }
-
-            val stockAdjustmentsArr = JSONArray()
-            for (sa in allStockAdjustments) {
-                stockAdjustmentsArr.put(JSONObject().apply {
-                    put("productId", sa.productId)
-                    put("productName", sa.productName)
-                    put("adjustmentType", sa.adjustmentType)
-                    put("reasonTitle", sa.reasonTitle)
-                    put("description", sa.description)
-                    put("quantity", sa.quantity)
-                    put("beforeQuantity", sa.beforeQuantity)
-                    put("afterQuantity", sa.afterQuantity)
-                    put("timestamp", sa.timestamp)
-                    put("adjustedBy", sa.adjustedBy)
-                })
-            }
-
-            val payload = JSONObject().apply {
-                put("userPhone", userPhone)
-                put("products", prodsArr)
-                put("vouchers", vouchersArr)
-                put("voucherItems", vItemsArr)
-                put("customers", custsArr)
-                put("groups", groupsArr)
-                put("units", unitsArr)
-                put("payments", paymentsArr)
-                put("suppliers", suppliersArr)
-                put("expenseCategories", expenseCatsArr)
-                put("expenses", expensesArr)
-                put("stockAdjustments", stockAdjustmentsArr)
-            }
-
             val targetUrl = "$cleanUrl/api/sync/mirror"
-            val conn = URL(targetUrl).openConnection() as HttpURLConnection
+            conn = URL(targetUrl).openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 25000
-            conn.readTimeout = 60000
+            conn.readTimeout = 90000
             conn.setRequestProperty("Content-Type", "application/json; utf-8")
+            conn.setRequestProperty("Accept", "application/json")
+            conn.applyAuthHeaders(authToken, deviceId)
             conn.doOutput = true
+            conn.setChunkedStreamingMode(0)
 
-            onProgress(0.6f, "Cloud ပေါ်သို့ စာရင်းများ ပေးပို့သိမ်းဆည်းနေပါသည်...")
-            OutputStreamWriter(conn.outputStream, "UTF-8").use { it.write(payload.toString()) }
+            onProgress(0.55f, "Cloud ပေါ်သို့ စာရင်းများ တိုက်ရိုက် Streaming ပေးပို့နေပါသည်...")
+            BufferedWriter(OutputStreamWriter(conn.outputStream, "UTF-8"), 32768).use { w ->
+                w.write("{\"userPhone\":")
+                w.writeJsonStr(userPhone)
+
+                w.write(",\"products\":[")
+                allProducts.forEachIndexed { idx, p ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"id\":${p.id},\"name\":")
+                    w.writeJsonStr(p.name)
+                    w.write(",\"groupName\":")
+                    w.writeJsonStr(p.groupName)
+                    w.write(",\"purchasePrice\":${safeDouble(p.purchasePrice)},\"sellingPrice\":${safeDouble(p.sellingPrice)},\"unit\":")
+                    w.writeJsonStr(p.unit)
+                    w.write(",\"barcode\":")
+                    w.writeJsonStr(p.barcode)
+                    w.write(",\"quantity\":${p.quantity},\"alertQuantity\":${p.alertQuantity},\"trackStock\":${p.trackStock},\"note\":")
+                    w.writeJsonStr(p.note)
+                    w.write("}")
+                }
+                w.write("]")
+
+                w.write(",\"vouchers\":[")
+                allVouchers.forEachIndexed { idx, v ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"receiptNo\":")
+                    w.writeJsonStr(v.receiptNo)
+                    w.write(",\"timestamp\":${v.timestamp},\"cashierName\":")
+                    w.writeJsonStr(v.cashierName)
+                    w.write(",\"totalAmount\":${safeDouble(v.totalAmount)},\"totalItems\":${v.totalItems},\"customerName\":")
+                    w.writeJsonStr(v.customerName)
+                    w.write(",\"paymentMethod\":")
+                    w.writeJsonStr(v.paymentMethod)
+                    w.write(",\"isCompleted\":${v.isCompleted},\"isPurchase\":${v.isPurchase},\"paidAmount\":${safeDouble(v.paidAmount)},\"changeAmount\":${safeDouble(v.changeAmount)},\"balanceAmount\":${safeDouble(v.balanceAmount)},\"note\":")
+                    w.writeJsonStr(v.note)
+                    w.write(",\"discount\":${safeDouble(v.discount)},\"fee\":${safeDouble(v.fee)}}")
+                }
+                w.write("]")
+
+                w.write(",\"voucherItems\":[")
+                allVoucherItems.forEachIndexed { idx, it ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"voucherId\":")
+                    w.writeJsonStr(it.voucherId)
+                    w.write(",\"productId\":${it.productId},\"productName\":")
+                    w.writeJsonStr(it.productName)
+                    w.write(",\"quantity\":${it.quantity},\"purchasePrice\":${safeDouble(it.purchasePrice)},\"sellingPrice\":${safeDouble(it.sellingPrice)}}")
+                }
+                w.write("]")
+
+                w.write(",\"customers\":[")
+                val seenCustNames = mutableSetOf<String>()
+                var custFirst = true
+                for (c in allCustomers) {
+                    val clean = c.name.trim()
+                    val norm = clean.lowercase()
+                    if (clean.isNotBlank() && seenCustNames.add(norm)) {
+                        if (!custFirst) w.write(",")
+                        custFirst = false
+                        w.write("{\"name\":")
+                        w.writeJsonStr(clean)
+                        w.write(",\"phone\":")
+                        w.writeJsonStr(c.phone)
+                        w.write(",\"address\":")
+                        w.writeJsonStr(c.address)
+                        w.write(",\"note\":")
+                        w.writeJsonStr(c.note)
+                        w.write("}")
+                    }
+                }
+                w.write("]")
+
+                w.write(",\"groups\":[")
+                allGroups.forEachIndexed { idx, g ->
+                    if (idx > 0) w.write(",")
+                    w.writeJsonStr(g)
+                }
+                w.write("]")
+
+                w.write(",\"units\":[")
+                allUnits.forEachIndexed { idx, u ->
+                    if (idx > 0) w.write(",")
+                    w.writeJsonStr(u)
+                }
+                w.write("]")
+
+                w.write(",\"payments\":[")
+                allPayments.forEachIndexed { idx, p ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"method\":")
+                    w.writeJsonStr(p.method)
+                    w.write(",\"amount\":${safeDouble(p.amount)},\"date\":${p.date}}")
+                }
+                w.write("]")
+
+                w.write(",\"suppliers\":[")
+                val seenSupNames = mutableSetOf<String>()
+                var supFirst = true
+                for (s in allSuppliers) {
+                    val clean = s.name.trim()
+                    val norm = clean.lowercase()
+                    if (clean.isNotBlank() && seenSupNames.add(norm)) {
+                        if (!supFirst) w.write(",")
+                        supFirst = false
+                        w.write("{\"name\":")
+                        w.writeJsonStr(clean)
+                        w.write(",\"phone\":")
+                        w.writeJsonStr(s.phone)
+                        w.write(",\"address\":")
+                        w.writeJsonStr(s.address)
+                        w.write(",\"note\":")
+                        w.writeJsonStr(s.note)
+                        w.write("}")
+                    }
+                }
+                w.write("]")
+
+                w.write(",\"expenseCategories\":[")
+                allExpenseCategories.forEachIndexed { idx, ec ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"name\":")
+                    w.writeJsonStr(ec.name)
+                    w.write(",\"iconName\":")
+                    w.writeJsonStr(ec.iconName)
+                    w.write("}")
+                }
+                w.write("]")
+
+                w.write(",\"expenses\":[")
+                allExpenses.forEachIndexed { idx, e ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"categoryName\":")
+                    w.writeJsonStr(e.categoryName)
+                    w.write(",\"description\":")
+                    w.writeJsonStr(e.description)
+                    w.write(",\"amount\":${safeDouble(e.amount)},\"paymentMethod\":")
+                    w.writeJsonStr(e.paymentMethod)
+                    w.write(",\"note\":")
+                    w.writeJsonStr(e.note)
+                    w.write(",\"timestamp\":${e.timestamp},\"dateString\":")
+                    w.writeJsonStr(e.dateString)
+                    w.write(",\"timeString\":")
+                    w.writeJsonStr(e.timeString)
+                    w.write("}")
+                }
+                w.write("]")
+
+                w.write(",\"stockAdjustments\":[")
+                allStockAdjustments.forEachIndexed { idx, sa ->
+                    if (idx > 0) w.write(",")
+                    w.write("{\"productId\":${sa.productId},\"productName\":")
+                    w.writeJsonStr(sa.productName)
+                    w.write(",\"adjustmentType\":")
+                    w.writeJsonStr(sa.adjustmentType)
+                    w.write(",\"reasonTitle\":")
+                    w.writeJsonStr(sa.reasonTitle)
+                    w.write(",\"description\":")
+                    w.writeJsonStr(sa.description)
+                    w.write(",\"quantity\":${sa.quantity},\"beforeQuantity\":${sa.beforeQuantity},\"afterQuantity\":${sa.afterQuantity},\"timestamp\":${sa.timestamp},\"adjustedBy\":")
+                    w.writeJsonStr(sa.adjustedBy)
+                    w.write("}")
+                }
+                w.write("]}")
+                w.flush()
+            }
+
+            onProgress(0.85f, "Cloud Server အတည်ပြုချက် စောင့်ဆိုင်းနေပါသည်...")
             val code = conn.responseCode
             if (code in 200..299) {
                 onProgress(0.95f, "Cloud စာရင်းများ အတည်ပြုပြီးပါပြီ")
@@ -661,11 +762,14 @@ object SyncManager {
                     message = "Local ဒေတာအတိုင်း Cloud ပေါ်သို့ အတိအကျ ၁၀၀% Mirror တင်ပြီးပါပြီ။"
                 )
             } else {
-                SyncResult(false, 0, 0, 0, "Server error: $code")
+                val errBody = try { conn.errorStream?.bufferedReader()?.use { it.readText() } ?: "" } catch (_: Exception) { "" }
+                SyncResult(false, 0, 0, 0, "Server error: $code ${errBody.take(120)}")
             }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            SyncResult(false, 0, 0, 0, "Mirror sync failed: ${e.message}")
+        } catch (t: Throwable) {
+            t.printStackTrace()
+            SyncResult(false, 0, 0, 0, "Mirror sync failed: ${t.message ?: t.javaClass.simpleName}")
+        } finally {
+            try { conn?.disconnect() } catch (_: Exception) {}
         }
     }
 
@@ -684,7 +788,9 @@ object SyncManager {
         pendingDeletedSuppliers: List<String> = emptyList(),
         pendingDeletedGroups: List<String> = emptyList(),
         pendingDeletedUnits: List<String> = emptyList(),
-        pendingDeletedPayments: List<String> = emptyList()
+        pendingDeletedPayments: List<String> = emptyList(),
+        authToken: String = "",
+        deviceId: String = ""
     ): SyncResult {
         if (userPhone.isBlank()) {
             return SyncResult(false, 0, 0, 0, "ကျေးဇူးပြု၍ အကောင့် Login ဝင်ထားပါ (No active user account)")
@@ -703,11 +809,11 @@ object SyncManager {
             try {
                 // 0. Sync pending deleted products and vouchers first
                 if (pendingDeletedProductIds.isNotEmpty() || pendingDeletedProductNames.isNotEmpty()) {
-                    deleteProductsOnCloud(workerUrl, userPhone, pendingDeletedProductIds, pendingDeletedProductNames)
+                    deleteProductsOnCloud(workerUrl, userPhone, pendingDeletedProductIds, pendingDeletedProductNames, authToken, deviceId)
                 }
                 if (pendingDeletedVouchers.isNotEmpty()) {
                     for (vId in pendingDeletedVouchers) {
-                        deleteVoucherOnCloud(workerUrl, userPhone, vId)
+                        deleteVoucherOnCloud(workerUrl, userPhone, vId, authToken, deviceId)
                     }
                 }
 
@@ -722,68 +828,74 @@ object SyncManager {
                 if (unsyncedVouchers.isNotEmpty()) {
                     val targetUrl = "$cleanUrl/api/sync/vouchers"
                     for (batch in unsyncedVouchers.chunked(150)) {
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
-                        conn.requestMethod = "POST"
-                        conn.connectTimeout = 20000
-                        conn.readTimeout = 35000
-                        conn.setRequestProperty("Content-Type", "application/json; utf-8")
-                        conn.setRequestProperty("Accept", "application/json")
-                        conn.doOutput = true
+                        var conn: HttpURLConnection? = null
+                        try {
+                            conn = URL(targetUrl).openConnection() as HttpURLConnection
+                            conn.requestMethod = "POST"
+                            conn.connectTimeout = 20000
+                            conn.readTimeout = 35000
+                            conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                            conn.setRequestProperty("Accept", "application/json")
+                            conn.applyAuthHeaders(authToken, deviceId)
+                            conn.doOutput = true
 
-                        val vouchersArray = JSONArray()
-                        val syncedIds = mutableListOf<String>()
+                            val vouchersArray = JSONArray()
+                            val syncedIds = mutableListOf<String>()
 
-                        for (v in batch) {
-                            val items = repository.getVoucherItemsDirect(v.receiptNo)
-                            val vObj = JSONObject().apply {
-                                put("receiptNo", v.receiptNo)
-                                put("timestamp", v.timestamp)
-                                put("cashierName", v.cashierName)
-                                put("totalAmount", v.totalAmount)
-                                put("totalItems", v.totalItems)
-                                put("customerName", v.customerName)
-                                put("paymentMethod", v.paymentMethod)
-                                put("isCompleted", v.isCompleted)
-                                put("isPurchase", v.isPurchase)
-                                put("paidAmount", v.paidAmount)
-                                put("changeAmount", v.changeAmount)
-                                put("balanceAmount", v.balanceAmount)
-                                put("discount", v.discount)
-                                put("fee", v.fee)
-                            }
+                            for (v in batch) {
+                                val items = repository.getVoucherItemsDirect(v.receiptNo)
+                                val vObj = JSONObject().apply {
+                                    put("receiptNo", v.receiptNo)
+                                    put("timestamp", v.timestamp)
+                                    put("cashierName", v.cashierName)
+                                    put("totalAmount", v.totalAmount)
+                                    put("totalItems", v.totalItems)
+                                    put("customerName", v.customerName)
+                                    put("paymentMethod", v.paymentMethod)
+                                    put("isCompleted", v.isCompleted)
+                                    put("isPurchase", v.isPurchase)
+                                    put("paidAmount", v.paidAmount)
+                                    put("changeAmount", v.changeAmount)
+                                    put("balanceAmount", v.balanceAmount)
+                                    put("discount", v.discount)
+                                    put("fee", v.fee)
+                                }
 
-                            val itemsArr = JSONArray()
-                            for (it in items) {
-                                itemsArr.put(JSONObject().apply {
-                                    put("productId", it.productId)
-                                    put("productName", it.productName)
-                                    put("quantity", it.quantity)
-                                    put("purchasePrice", it.purchasePrice)
-                                    put("sellingPrice", it.sellingPrice)
+                                val itemsArr = JSONArray()
+                                for (it in items) {
+                                    itemsArr.put(JSONObject().apply {
+                                        put("productId", it.productId)
+                                        put("productName", it.productName)
+                                        put("quantity", it.quantity)
+                                        put("purchasePrice", it.purchasePrice)
+                                        put("sellingPrice", it.sellingPrice)
+                                    })
+                                }
+
+                                vouchersArray.put(JSONObject().apply {
+                                    put("voucher", vObj)
+                                    put("items", itemsArr)
                                 })
+                                syncedIds.add(v.receiptNo)
                             }
 
-                            vouchersArray.put(JSONObject().apply {
-                                put("voucher", vObj)
-                                put("items", itemsArr)
-                            })
-                            syncedIds.add(v.receiptNo)
-                        }
+                            val rootJson = JSONObject().apply {
+                                put("userPhone", userPhone)
+                                put("vouchers", vouchersArray)
+                            }
 
-                        val rootJson = JSONObject().apply {
-                            put("userPhone", userPhone)
-                            put("vouchers", vouchersArray)
-                        }
+                            OutputStreamWriter(conn.outputStream, "UTF-8").use { os ->
+                                os.write(rootJson.toString())
+                                os.flush()
+                            }
 
-                        OutputStreamWriter(conn.outputStream, "UTF-8").use { os ->
-                            os.write(rootJson.toString())
-                            os.flush()
-                        }
-
-                        val code = conn.responseCode
-                        if (code in 200..299) {
-                            repository.markVouchersSynced(syncedIds)
-                            syncedVouchersCount += syncedIds.size
+                            val code = conn.responseCode
+                            if (code in 200..299) {
+                                repository.markVouchersSynced(syncedIds)
+                                syncedVouchersCount += syncedIds.size
+                            }
+                        } finally {
+                            try { conn?.disconnect() } catch (_: Exception) {}
                         }
                     }
                 }
@@ -793,46 +905,52 @@ object SyncManager {
                 if (unsyncedProducts.isNotEmpty()) {
                     val targetUrl = "$cleanUrl/api/sync/products"
                     for (batch in unsyncedProducts.chunked(250)) {
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
-                        conn.requestMethod = "POST"
-                        conn.connectTimeout = 20000
-                        conn.readTimeout = 35000
-                        conn.setRequestProperty("Content-Type", "application/json; utf-8")
-                        conn.doOutput = true
+                        var conn: HttpURLConnection? = null
+                        try {
+                            conn = URL(targetUrl).openConnection() as HttpURLConnection
+                            conn.requestMethod = "POST"
+                            conn.connectTimeout = 20000
+                            conn.readTimeout = 35000
+                            conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                            conn.applyAuthHeaders(authToken, deviceId)
+                            conn.doOutput = true
 
-                        val prodsArr = JSONArray()
-                        val pIds = mutableListOf<Long>()
-                        for (p in batch) {
-                            val isManual = (p.id in manualStockAdjustedProductIds)
-                            prodsArr.put(JSONObject().apply {
-                                put("id", p.id)
-                                put("name", p.name)
-                                put("groupName", p.groupName)
-                                put("purchasePrice", p.purchasePrice)
-                                put("sellingPrice", p.sellingPrice)
-                                put("unit", p.unit)
-                                put("barcode", p.barcode)
-                                put("quantity", p.quantity)
-                                put("alertQuantity", p.alertQuantity)
-                                put("trackStock", p.trackStock)
-                                put("note", p.note)
-                                if (isManual) {
-                                    put("isManualStockAdjustment", true)
-                                }
-                            })
-                            pIds.add(p.id)
-                        }
+                            val prodsArr = JSONArray()
+                            val pIds = mutableListOf<Long>()
+                            for (p in batch) {
+                                val isManual = (p.id in manualStockAdjustedProductIds)
+                                prodsArr.put(JSONObject().apply {
+                                    put("id", p.id)
+                                    put("name", p.name)
+                                    put("groupName", p.groupName)
+                                    put("purchasePrice", p.purchasePrice)
+                                    put("sellingPrice", p.sellingPrice)
+                                    put("unit", p.unit)
+                                    put("barcode", p.barcode)
+                                    put("quantity", p.quantity)
+                                    put("alertQuantity", p.alertQuantity)
+                                    put("trackStock", p.trackStock)
+                                    put("note", p.note)
+                                    if (isManual) {
+                                        put("isManualStockAdjustment", true)
+                                    }
+                                })
+                                pIds.add(p.id)
+                            }
 
-                        val payload = JSONObject().apply {
-                            put("userPhone", userPhone)
-                            put("products", prodsArr)
-                        }
+                            val payload = JSONObject().apply {
+                                put("userPhone", userPhone)
+                                put("products", prodsArr)
+                            }
 
-                        OutputStreamWriter(conn.outputStream, "UTF-8").use { it.write(payload.toString()) }
-                        val code = conn.responseCode
-                        if (code in 200..299) {
-                            repository.markProductsSynced(pIds)
-                            syncedProductsCount += pIds.size
+                            OutputStreamWriter(conn.outputStream, "UTF-8").use { it.write(payload.toString()) }
+                            val code = conn.responseCode
+                            if (code in 200..299) {
+                                repository.markProductsSynced(pIds)
+                                syncedProductsCount += pIds.size
+                            }
+                        } finally {
+                            try { conn?.disconnect() } catch (_: Exception) {}
                         }
                     }
                 }
@@ -840,13 +958,15 @@ object SyncManager {
                 // 3. Sync pending customers
                 val unsyncedCustomers = repository.getUnsyncedCustomers()
                 if (unsyncedCustomers.isNotEmpty() || pendingDeletedCustomers.isNotEmpty()) {
+                    var conn: HttpURLConnection? = null
                     try {
                         val targetUrl = "$cleanUrl/api/sync/customers"
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn = URL(targetUrl).openConnection() as HttpURLConnection
                         conn.requestMethod = "POST"
                         conn.connectTimeout = 10000
                         conn.readTimeout = 10000
                         conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.applyAuthHeaders(authToken, deviceId)
                         conn.doOutput = true
 
                         val custArr = JSONArray()
@@ -884,19 +1004,23 @@ object SyncManager {
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "Customers sync error: ${e.message}")
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Exception) {}
                     }
                 }
 
                 // 4. Sync product groups (categories)
                 val allGroups = repository.getAllGroupsDirect()
                 if (allGroups.isNotEmpty() || pendingDeletedGroups.isNotEmpty()) {
+                    var conn: HttpURLConnection? = null
                     try {
                         val targetUrl = "$cleanUrl/api/sync/groups"
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn = URL(targetUrl).openConnection() as HttpURLConnection
                         conn.requestMethod = "POST"
                         conn.connectTimeout = 8000
                         conn.readTimeout = 8000
                         conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.applyAuthHeaders(authToken, deviceId)
                         conn.doOutput = true
 
                         val grpArr = JSONArray()
@@ -913,19 +1037,23 @@ object SyncManager {
                         conn.responseCode
                     } catch (e: Exception) {
                         Log.e(TAG, "Groups sync error: ${e.message}")
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Exception) {}
                     }
                 }
 
                 // 5. Sync product units
                 val allUnits = repository.getAllUnitsDirect()
                 if (allUnits.isNotEmpty() || pendingDeletedUnits.isNotEmpty()) {
+                    var conn: HttpURLConnection? = null
                     try {
                         val targetUrl = "$cleanUrl/api/sync/units"
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn = URL(targetUrl).openConnection() as HttpURLConnection
                         conn.requestMethod = "POST"
                         conn.connectTimeout = 8000
                         conn.readTimeout = 8000
                         conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.applyAuthHeaders(authToken, deviceId)
                         conn.doOutput = true
 
                         val untArr = JSONArray()
@@ -942,19 +1070,23 @@ object SyncManager {
                         conn.responseCode
                     } catch (e: Exception) {
                         Log.e(TAG, "Units sync error: ${e.message}")
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Exception) {}
                     }
                 }
 
                 // 6. Sync payment methods
                 val allPayments = repository.getAllPaymentsDirect()
                 if (allPayments.isNotEmpty() || pendingDeletedPayments.isNotEmpty()) {
+                    var conn: HttpURLConnection? = null
                     try {
                         val targetUrl = "$cleanUrl/api/sync/payments"
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn = URL(targetUrl).openConnection() as HttpURLConnection
                         conn.requestMethod = "POST"
                         conn.connectTimeout = 8000
                         conn.readTimeout = 8000
                         conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.applyAuthHeaders(authToken, deviceId)
                         conn.doOutput = true
 
                         val payArr = JSONArray()
@@ -977,19 +1109,23 @@ object SyncManager {
                         conn.responseCode
                     } catch (e: Exception) {
                         Log.e(TAG, "Payments sync error: ${e.message}")
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Exception) {}
                     }
                 }
 
                 // 7. Sync suppliers
                 val allSuppliers = repository.getAllSuppliersDirect()
                 if (allSuppliers.isNotEmpty() || pendingDeletedSuppliers.isNotEmpty()) {
+                    var conn: HttpURLConnection? = null
                     try {
                         val targetUrl = "$cleanUrl/api/sync/suppliers"
-                        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                        conn = URL(targetUrl).openConnection() as HttpURLConnection
                         conn.requestMethod = "POST"
                         conn.connectTimeout = 8000
                         conn.readTimeout = 8000
                         conn.setRequestProperty("Content-Type", "application/json; utf-8")
+                        conn.applyAuthHeaders(authToken, deviceId)
                         conn.doOutput = true
 
                         val supArr = JSONArray()
@@ -1020,6 +1156,8 @@ object SyncManager {
                         conn.responseCode
                     } catch (e: Exception) {
                         Log.e(TAG, "Suppliers sync error: ${e.message}")
+                    } finally {
+                        try { conn?.disconnect() } catch (_: Exception) {}
                     }
                 }
 
@@ -1027,7 +1165,13 @@ object SyncManager {
                 if (totalSynced > 0) {
                     // Pull updated cloud data immediately so local stock matches the server's absolute reconciled stock
                     try {
-                        pullCloudData(workerUrl, userPhone, repository)
+                        pullCloudData(
+                            workerUrl = workerUrl,
+                            userPhone = userPhone,
+                            repository = repository,
+                            authToken = authToken,
+                            deviceId = deviceId
+                        )
                     } catch (e: Exception) {
                         Log.e(TAG, "Auto-pull after sync error: ${e.message}")
                     }
@@ -1036,9 +1180,9 @@ object SyncManager {
                 } else {
                     SyncResult(true, 0, 0, 0, "ဒေတာအားလုံး (ပစ္စည်း၊ အမျိုးအစား၊ ယူနစ်၊ ဖောက်သည်၊ ကုန်သွင်းသူ၊ ငွေပေးချေမှု) Cloud ပေါ်တွင် ရောက်ရှိပြီးဖြစ်ပါသည်")
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Batch sync failed: ${e.message}")
-                SyncResult(false, 0, 0, 0, "Sync ချိတ်ဆက်မှု မအောင်မြင်ပါ: ${e.message}")
+            } catch (t: Throwable) {
+                Log.e(TAG, "Batch sync failed: ${t.message}")
+                SyncResult(false, 0, 0, 0, "Sync ချိတ်ဆက်မှု မအောင်မြင်ပါ: ${t.message ?: t.javaClass.simpleName}")
             }
         }
     }
@@ -1056,10 +1200,16 @@ object SyncManager {
         pendingDeletedGroups: Set<String> = emptySet(),
         pendingDeletedUnits: Set<String> = emptySet(),
         pendingDeletedPayments: Set<String> = emptySet(),
-        onProgress: (Float, String) -> Unit = { _, _ -> }
+        onProgress: (Float, String) -> Unit = { _, _ -> },
+        authToken: String = "",
+        deviceId: String = "",
+        pendingRestoreMirror: Boolean = false
     ): PullResult {
         if (userPhone.isBlank()) {
             return PullResult(false, message = "ကျေးဇူးပြု၍ Login အရင်ဝင်ပါ")
+        }
+        if (pendingRestoreMirror) {
+            return PullResult(false, message = "DB Restore ကို Cloud သို့ Mirror တင်နေဆဲဖြစ်ပါသည်")
         }
 
         return withContext(Dispatchers.IO) {
@@ -1069,15 +1219,17 @@ object SyncManager {
                 return@withContext PullResult(false, message = check.message)
             }
 
+            var conn: HttpURLConnection? = null
             try {
                 onProgress(0.20f, "Cloud မှ ဒေတာများ ရယူနေပါသည်...")
                 val targetUrl = workerUrl.trim().removeSuffix("/") + "/api/sync/pull"
-                val conn = URL(targetUrl).openConnection() as HttpURLConnection
+                conn = URL(targetUrl).openConnection() as HttpURLConnection
                 conn.requestMethod = "POST"
                 conn.connectTimeout = 20000
                 conn.readTimeout = 45000
                 conn.setRequestProperty("Content-Type", "application/json; utf-8")
                 conn.setRequestProperty("Accept", "application/json")
+                conn.applyAuthHeaders(authToken, deviceId)
                 conn.doOutput = true
 
                 val req = JSONObject().apply { put("userPhone", userPhone) }
@@ -1197,10 +1349,23 @@ object SyncManager {
                         vCount++
                     }
 
-                    // Multi-device voucher deletion sync: delete local synced vouchers that were deleted on another phone or cloud
+                    // Multi-device voucher deletion sync: delete local synced vouchers via explicit tombstones or only when cloud vouchers array is non-empty
+                    val deletedVouchersFromCloud = HashSet<String>()
+                    val delVouchersArr = resObj.optJSONArray("deletedVouchers")
+                    if (delVouchersArr != null) {
+                        for (i in 0 until delVouchersArr.length()) {
+                            val key = delVouchersArr.optString(i).trim()
+                            if (key.isNotBlank()) {
+                                deletedVouchersFromCloud.add(key)
+                                deletedVouchersFromCloud.add(key.lowercase())
+                            }
+                        }
+                    }
                     val allLocalVouchers = repository.getAllVouchersDirect()
                     for (lv in allLocalVouchers) {
-                        if (lv.isSynced && lv.receiptNo !in cloudVoucherReceiptNos) {
+                        val isExplicitlyDeleted = lv.receiptNo in deletedVouchersFromCloud || lv.receiptNo.lowercase() in deletedVouchersFromCloud
+                        val missingFromNonEmptyCloud = vouchersArr.length() > 0 && lv.receiptNo !in cloudVoucherReceiptNos
+                        if (lv.isSynced && (isExplicitlyDeleted || missingFromNonEmptyCloud)) {
                             repository.deleteVoucher(lv.receiptNo)
                             repository.deleteVoucherItems(lv.receiptNo)
                         }
@@ -1313,14 +1478,24 @@ object SyncManager {
                         pCount++
                     }
 
-                    // Multi-device deletion sync: delete local products that were deleted on another phone (or replaced by name after restore)
+                    // Multi-device deletion sync: honor explicit deletedProducts tombstones and prune missing synced items ONLY when cloud products array is non-empty
+                    val deletedProductsFromCloud = HashSet<String>()
+                    val delProdsArr = resObj.optJSONArray("deletedProducts")
+                    if (delProdsArr != null) {
+                        for (i in 0 until delProdsArr.length()) {
+                            val key = delProdsArr.optString(i).trim().lowercase()
+                            if (key.isNotBlank()) deletedProductsFromCloud.add(key)
+                        }
+                    }
                     val refreshedProds = repository.getAllProductsDirect()
                     val seenLocalNames = HashSet<String>()
                     for (lp in refreshedProds) {
                         val lpNorm = lp.name.trim().lowercase()
+                        val isExplicitlyDeleted = lpNorm in deletedProductsFromCloud || (lp.id > 0 && lp.id.toString() in deletedProductsFromCloud)
                         val inCloud = lpNorm in cloudProductNames || (lp.id > 0 && lp.id in cloudProductIds && lpNorm in cloudProductNames)
+                        val missingFromNonEmptyCloud = prodsArr.length() > 0 && !inCloud
                         val isDupName = !seenLocalNames.add(lpNorm)
-                        if (lp.isSynced && (!inCloud || isDupName)) {
+                        if (lp.isSynced && (isExplicitlyDeleted || missingFromNonEmptyCloud || isDupName)) {
                             repository.deleteProduct(lp)
                         }
                     }
@@ -1642,9 +1817,11 @@ object SyncManager {
                     customersRestored = cCount,
                     message = "Cloud မှ အောင်မြင်စွာ ပြန်လည်ရယူပြီးပါပြီ (အရောင်း/အဝယ်: $vCount, ပစ္စည်း: $pCount, ဖောက်သည်: $cCount, အမျိုးအစား: ${groupsArr.length()}, ယူနစ်: ${unitsArr.length()}, ကုန်သွင်းသူ: ${suppliersArr.length()}, ကုန်ကျစရိတ်: ${expensesArr.length()})"
                 )
-            } catch (e: Exception) {
-                Log.e(TAG, "Pull cloud data failed: ${e.message}")
-                PullResult(false, message = "Cloud မှ ပြန်လည်ရယူရာတွင် အမှားဖြစ်ပေါ်ပါသည်: ${e.message}")
+            } catch (t: Throwable) {
+                Log.e(TAG, "Pull cloud data failed: ${t.message}")
+                PullResult(false, message = "Cloud မှ ပြန်လည်ရယူရာတွင် အမှားဖြစ်ပေါ်ပါသည်: ${t.message ?: t.javaClass.simpleName}")
+            } finally {
+                try { conn?.disconnect() } catch (_: Exception) {}
             }
         }
     }
